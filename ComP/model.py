@@ -1,8 +1,13 @@
+from typing import Callable, Dict, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modules.Attention import *
+try:
+    from .modules.Attention import *
+except ImportError:  # official train_mr.py imports model.py as a top-level module
+    from modules.Attention import *
 def calc_cosine_similarity(feat1, feat2):
     """
     feat1: [batch, m, dim]
@@ -40,7 +45,7 @@ class PromptFormer(nn.Module):
         prototype = self.proj_n(x.permute(0,2,1)).permute(0,2,1) # [batch, n_proto, dim]
         sim = calc_cosine_similarity(x, prototype) # [batch*seqlen, n_proto]
         prototype = prototype.reshape(-1, self.D_e) # [batch*n_proto, dim]
-        mask = umask.view(-1).unsqueeze(1).repeat(1,self.n_proto*batch_size) # [batch*seqlen, n_proto]
+        mask = umask.to(x.dtype).reshape(-1).unsqueeze(1).repeat(1,self.n_proto*batch_size) # [batch*seqlen, n_proto]
         mask = (1 - mask) * -10000.0
         sim = sim + mask
         sim = F.softmax(sim,dim=1)
@@ -74,7 +79,7 @@ class PromptFormer_2(nn.Module):
         batch_size = x.size(0)
         sim = calc_cosine_similarity(x, prototype) # [batch*seqlen, n_proto]
         prototype = prototype.reshape(-1, self.D_e) # [batch*n_proto, dim]
-        mask = umask.view(-1).unsqueeze(1).repeat(1,self.n_proto*batch_size) # [batch*seqlen, n_proto]
+        mask = umask.to(x.dtype).reshape(-1).unsqueeze(1).repeat(1,self.n_proto*batch_size) # [batch*seqlen, n_proto]
         mask = (1 - mask) * -10000.0
         sim = sim + mask
         sim = F.softmax(sim,dim=1)
@@ -169,7 +174,21 @@ class ComP(nn.Module):
         self.prop_former_t_2 = PromptFormer_2(sqlen=self.seq_len, n_proto=10, D_e=D_e, prompt_dim=self.prompt_dim, args=args)
            
 
-    def forward(self, inputfeats, label, input_features_mask=None, umask=None, first_stage=False):
+    def forward(
+        self,
+        inputfeats,
+        label,
+        input_features_mask=None,
+        umask=None,
+        first_stage=False,
+        return_intermediates=False,
+        coordinator_mode="on",
+        coordinator_fixed_weights=None,
+        fix_private_branch=False,
+        fusion_fn: Optional[
+            Callable[[Dict[str, torch.Tensor], torch.Tensor], Dict[str, torch.Tensor]]
+        ] = None,
+    ):
         """
         inputfeats -> ?*[seqlen, batch, dim]
         qmask -> [batch, seqlen]
@@ -179,6 +198,8 @@ class ComP(nn.Module):
         """
         # print(inputfeats[:,:,:])
         # print(input_features_mask[:,:,1])
+        if coordinator_mode not in {"on", "fixed", "off"}:
+            raise ValueError(f"unsupported coordinator_mode: {coordinator_mode}")
         weight_save = []
         # sequence modeling
         audio, text, video = inputfeats[:, :, :self.adim], inputfeats[:, :, self.adim:self.adim + self.tdim], \
@@ -211,7 +232,14 @@ class ComP(nn.Module):
         shared_atv = torch.cat([shared_a, shared_t, shared_v], dim=-1)
         private_atv = torch.cat([private_a, private_t, private_v], dim=-1)
 
+        prompt_candidates = {}
+        post_fusion_candidates = {}
+        coordinator_logits = None
+        coordinator_weights = None
+
         if first_stage:
+            if fusion_fn is not None:
+                raise ValueError("source fusion is only supported in stage-2")
             # --> [batch, 3*seqlen, dim]
             x_a = self.block1(shared_a, first_stage, attn_mask, 'a')
             x_t = self.block1(shared_t, first_stage, attn_mask, 't')
@@ -223,9 +251,11 @@ class ComP(nn.Module):
             out_t = self.nlp_head_t(x_t)
             out_v = self.nlp_head_v(x_v)
             
+            private_input_t = private_t if fix_private_branch else private_a
+            private_input_v = private_v if fix_private_branch else private_a
             out_a_private = self.block1(private_a, first_stage, attn_mask, 'a')
-            out_t_private = self.block1(private_a, first_stage, attn_mask, 't')
-            out_v_private = self.block1(private_a, first_stage, attn_mask, 'v')
+            out_t_private = self.block1(private_input_t, first_stage, attn_mask, 't')
+            out_v_private = self.block1(private_input_v, first_stage, attn_mask, 'v')
             out_a_private = self.block2(out_a_private, first_stage, attn_mask, 'a')
             out_t_private = self.block2(out_t_private, first_stage, attn_mask, 't')
             out_v_private = self.block2(out_v_private, first_stage, attn_mask, 'v')
@@ -276,16 +306,80 @@ class ComP(nn.Module):
             x_out_t = x_t
             x_out_v = x_v
 
+            # g_m is the stage-2 modality-specific representation immediately
+            # before the coordinator. It is not a prompt (prompt_dim=16) and
+            # not a task logit.
+            prompt_candidates = {
+                "audio": x_out_a,
+                "text": x_out_t,
+                "video": x_out_v,
+            }
+            post_fusion_candidates = dict(prompt_candidates)
+            if fusion_fn is not None:
+                fused = fusion_fn(
+                    {name: value for name, value in prompt_candidates.items()},
+                    input_mask.bool(),
+                )
+                if set(fused) != {"audio", "text", "video"}:
+                    raise KeyError(
+                        "fusion_fn must return audio, text, and video candidates"
+                    )
+                for modality in ("audio", "text", "video"):
+                    expected = prompt_candidates[modality].shape
+                    if fused[modality].shape != expected:
+                        raise ValueError(
+                            f"fused {modality} shape={tuple(fused[modality].shape)}, "
+                            f"expected {tuple(expected)}"
+                        )
+                    if fused[modality].device != prompt_candidates[modality].device:
+                        raise ValueError(f"fused {modality} device mismatch")
+                    if fused[modality].dtype != prompt_candidates[modality].dtype:
+                        raise TypeError(f"fused {modality} dtype mismatch")
+                post_fusion_candidates = {
+                    modality: fused[modality] for modality in ("audio", "text", "video")
+                }
+                x_out_a = post_fusion_candidates["audio"]
+                x_out_t = post_fusion_candidates["text"]
+                x_out_v = post_fusion_candidates["video"]
+
             out_a = self.nlp_head_a(x_out_a)
             out_t = self.nlp_head_t(x_out_t)
             out_v = self.nlp_head_v(x_out_v)
 
             x = torch.cat([x_out_a, x_out_t, x_out_v], dim=-1)# [batch, seq_len, 3 * D_e]
-            weights = torch.softmax(self.router(x),dim=-1)# [batch, seq_len, 3]
-            weights = weights.unsqueeze(-1)  # [batch, seq_len, 3, 1]
-            x_unweighted = torch.stack([x_a, x_t, x_v], dim=2)  # [batch, seq_len, 3, D_e]
-            x_out = weights * x_unweighted  # [batch, seq_len, 3, D_e]
-            x_out_a, x_out_t, x_out_v = torch.unbind(x_out, dim=2)
+            if coordinator_mode == "on":
+                coordinator_logits = self.router(x)
+                coordinator_weights = torch.softmax(coordinator_logits, dim=-1)
+            elif coordinator_mode == "fixed":
+                if coordinator_fixed_weights is None:
+                    fixed = torch.full(
+                        (3,),
+                        1.0 / 3.0,
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                else:
+                    fixed = torch.as_tensor(
+                        coordinator_fixed_weights, dtype=x.dtype, device=x.device
+                    ).reshape(3)
+                    if (~torch.isfinite(fixed)).any() or (fixed < 0).any():
+                        raise ValueError(
+                            "coordinator_fixed_weights must be finite and non-negative"
+                        )
+                    if fixed.sum() <= 0:
+                        raise ValueError("coordinator_fixed_weights must have positive sum")
+                    fixed = fixed / fixed.sum()
+                coordinator_weights = fixed.view(1, 1, 3).expand(
+                    x_out_a.size(0), x_out_a.size(1), 3
+                )
+
+            if coordinator_mode in {"on", "fixed"}:
+                weights = coordinator_weights.unsqueeze(-1)  # [B,T,3,1]
+                x_unweighted = torch.stack(
+                    [x_out_a, x_out_t, x_out_v], dim=2
+                )  # [B,T,3,D_e]
+                x_out = weights * x_unweighted  # [B,T,3,D_e]
+                x_out_a, x_out_t, x_out_v = torch.unbind(x_out, dim=2)
             x_joint = torch.cat([x_out_a, x_out_t, x_out_v], dim=-1)
 
             out_a_private, out_t_private, out_v_private = 0, 0, 0 #仅做占位用
@@ -301,7 +395,41 @@ class ComP(nn.Module):
 
         
 
-        return hidden, out, out_a, out_t, out_v, np.array(weight_save), proj_atv, proj_atv_rec, shared_atv, private_atv, out_atv_private
+        outputs = (
+            hidden,
+            out,
+            out_a,
+            out_t,
+            out_v,
+            np.array(weight_save),
+            proj_atv,
+            proj_atv_rec,
+            shared_atv,
+            private_atv,
+            out_atv_private,
+        )
+        if return_intermediates:
+            intermediates = {
+                "stage": "stage1" if first_stage else "stage2",
+                "prompt_candidates": prompt_candidates,
+                "post_fusion_candidates": post_fusion_candidates,
+                "modality_logits": {
+                    "audio": out_a,
+                    "text": out_t,
+                    "video": out_v,
+                },
+                "coordinator_logits": coordinator_logits,
+                "coordinator_weights": coordinator_weights,
+                "coordinator_mode": coordinator_mode,
+                "input_mask": input_mask,
+                "proj_atv": proj_atv,
+                "proj_atv_rec": proj_atv_rec,
+                "shared_atv": shared_atv,
+                "private_atv": private_atv,
+                "out_atv_private": out_atv_private,
+            }
+            return (*outputs, intermediates)
+        return outputs
 
 
 if __name__ == '__main__':
