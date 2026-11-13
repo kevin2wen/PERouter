@@ -84,6 +84,11 @@ class PERStudent(nn.Module):
         self.top_k = int(top_k)
         self.task = task
         self.use_router = bool(use_router)
+        self.per_mode = str(getattr(args, "per_mode", "task_router"))
+        self.fixed_source_weight = float(getattr(args, "fixed_source_weight", 0.5))
+        self.use_learned_router = self.use_router and self.per_mode != "fixed"
+        if self.per_mode == "fixed" and not 0.0 <= self.fixed_source_weight <= 1.0:
+            raise ValueError("fixed_source_weight must be in [0,1]")
         self.fix_private_branch = bool(fix_private_branch)
         self.coordinator_mode = getattr(args, "coordinator_mode", "on")
         self.coordinator_fixed_weights = getattr(
@@ -117,10 +122,14 @@ class PERStudent(nn.Module):
                     "video": nn.Linear(self.vdim, self.dim),
                 }
             )
-            self.router = PERRouter(
-                self.dim,
-                hidden_dim=router_hidden,
-                dropout=router_dropout,
+            self.router = (
+                PERRouter(
+                    self.dim,
+                    hidden_dim=router_hidden,
+                    dropout=router_dropout,
+                )
+                if self.use_learned_router
+                else None
             )
         else:
             # B0/generated modes must not add unused router parameters.
@@ -230,6 +239,8 @@ class PERStudent(nn.Module):
         availability: torch.BoolTensor,
         evidence: Optional[EvidenceBatch] = None,
         return_intermediates: bool = True,
+        route_override: Optional[torch.Tensor] = None,
+        evidence_vectors_override: Optional[Dict[str, torch.Tensor]] = None,
     ) -> PEROutput:
         if availability.dtype != torch.bool:
             raise TypeError("availability must be torch.bool")
@@ -242,9 +253,24 @@ class PERStudent(nn.Module):
         packed = self._pack_features(features, availability)
         if self.use_router:
             target_modalities = ~availability
-            evidence_vectors = self.evidence_encoder(
-                evidence, availability, target_modalities
-            )
+            if evidence_vectors_override is None:
+                evidence_vectors = self.evidence_encoder(
+                    evidence, availability, target_modalities
+                )
+            else:
+                if set(evidence_vectors_override) != set(MODALITIES):
+                    raise KeyError('evidence_vectors_override must contain all modalities')
+                evidence_vectors = {}
+                for modality in MODALITIES:
+                    value = evidence_vectors_override[modality]
+                    expected = (batch_size, seq_len, self.dim)
+                    if tuple(value.shape) != expected:
+                        raise ValueError(
+                            f'override {modality} shape={tuple(value.shape)}, expected {expected}'
+                        )
+                    if not torch.isfinite(value).all():
+                        raise FloatingPointError(f'override {modality} is non-finite')
+                    evidence_vectors[modality] = value.to(device=packed.device, dtype=packed.dtype)
             evidence_available = evidence.mask.any(dim=-1).unsqueeze(-1).expand(
                 -1, -1, 3
             )
@@ -299,16 +325,33 @@ class PERStudent(nn.Module):
 
         def fuse(prompts, _input_mask):
             generated_summary = gather_modality_summary(prompts)
-            route_logits = self.router(
-                observed_summary,
-                generated_summary,
-                gather_modality_summary(evidence_vectors),
-                availability,
-                confidence,
-            )
-            route = masked_route_probability(
-                route_logits, availability, evidence_available
-            )
+            if route_override is not None:
+                if route_override.shape != availability.shape:
+                    raise ValueError("route_override must match availability [B,T,3]")
+                if not torch.isfinite(route_override).all():
+                    raise FloatingPointError("route_override contains non-finite values")
+                route_logits = torch.zeros_like(route_holder["route"])
+                active = (~availability) & evidence_available
+                route = route_override.to(route_holder["route"]) * active.to(
+                    route_holder["route"].dtype
+                )
+            elif self.use_learned_router:
+                route_logits = self.router(
+                    observed_summary,
+                    generated_summary,
+                    gather_modality_summary(evidence_vectors),
+                    availability,
+                    confidence,
+                )
+                route = masked_route_probability(
+                    route_logits, availability, evidence_available
+                )
+            else:
+                route_logits = torch.zeros_like(route_holder["route"])
+                active = (~availability) & evidence_available
+                route = torch.full_like(
+                    route_holder["route"], self.fixed_source_weight
+                ) * active.to(route_holder["route"].dtype)
             route_holder["logits"] = route_logits
             route_holder["route"] = route
             return fuse_candidates(

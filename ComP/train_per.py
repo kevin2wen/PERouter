@@ -32,13 +32,31 @@ from ComP.per.batch import (
     collate_per,
     move_batch_to_device,
 )
-from ComP.per.evidence import FeatureNeighborRetriever, empty_evidence, perturb_evidence
+from ComP.per.evidence import (
+    FeatureNeighborRetriever,
+    empty_evidence,
+    perturb_evidence,
+    randomize_evidence,
+    shuffled_evidence,
+    source_only_evidence,
+)
+from ComP.per.diagnostics import RouteDiagnosticsAccumulator
+from ComP.per.evidence_audit import EvidenceCoverageAccumulator
+from ComP.per.evaluation_audit import EvaluationAuditAccumulator
+from ComP.per.fusion_diagnostics import FusionDiagnosticsAccumulator
+from ComP.per.gradient_diagnostics import (
+    component_gradient_norms,
+    parameter_grad_norm,
+)
+from ComP.per.teacher_diagnostics import pearson, spearman
 from ComP.per.losses import (
+    masked_reconstruction_loss,
     build_route_target,
     masked_task_loss,
     per_loss,
 )
 from ComP.per.missing import MaskManifest, MissingPatternSampler
+from ComP.per.manifest_utils import resolve_manifest_path, sha256_file
 from ComP.per.model import PERStudent
 from ComP.per.teacher import CompleteViewTeacher
 from ComP.per.types import MODALITIES, EvidenceBatch, PERBatch, PEROutput
@@ -46,7 +64,7 @@ from ComP.per.types import MODALITIES, EvidenceBatch, PERBatch, PEROutput
 
 LEGACY_PROTOCOL = "legacy-compat"
 FAIR_PROTOCOL = "fair"
-PER_MODES = ("off", "generated", "task_router", "teacher_router")
+PER_MODES = ("off", "generated", "fixed", "task_router", "teacher_router")
 
 
 class EpochRandomSampler(Sampler[int]):
@@ -293,8 +311,10 @@ def _load_evidence(
     evidence_mode: str,
     evidence_dim: int,
     top_k: int,
+    *,
+    seed: int = 0,
 ) -> EvidenceBatch:
-    if evidence_mode == "empty" or retriever is None:
+    if evidence_mode == "empty":
         return empty_evidence(
             batch.sequence_mask.size(0),
             batch.sequence_mask.size(1),
@@ -303,13 +323,33 @@ def _load_evidence(
             device=batch.sequence_mask.device,
             dtype=batch.features[MODALITIES[0]].dtype,
         )
-    return retriever.retrieve(
+    if retriever is None:
+        raise ValueError(f"evidence mode {evidence_mode} requires a retriever")
+    reference = retriever.retrieve(
         batch.features,
         batch.availability,
         batch.sequence_mask,
         batch.sample_ids,
         batch.utterance_ids,
     )
+    if evidence_mode == "feature":
+        return reference
+    if evidence_mode == "random":
+        return randomize_evidence(
+            reference,
+            retriever,
+            seed=seed,
+            query_sample_ids=batch.sample_ids,
+        )
+    if evidence_mode == "shuffled":
+        return shuffled_evidence(
+            reference,
+            seed=seed,
+            query_sample_ids=batch.sample_ids,
+        )
+    if evidence_mode == "source_only":
+        return source_only_evidence(reference)
+    raise ValueError(f"unsupported evidence mode: {evidence_mode}")
 
 
 def _build_retriever(
@@ -418,6 +458,9 @@ def _stage2_loss(
         raise RuntimeError("ComP did not return modality logits")
     if not output.intermediates:
         raise RuntimeError("stage-2 PEROutput requires intermediates")
+    evidence_available = None
+    if batch.evidence is not None:
+        evidence_available = batch.evidence.mask.any(dim=-1).unsqueeze(-1).expand(-1, -1, 3)
     denominators = per_loss(
         output,
         batch.labels,
@@ -429,6 +472,8 @@ def _stage2_loss(
         lambda_kd=args.kd_weight,
         kd_temperature=args.kd_temperature,
         sequence_mask=batch.sequence_mask,
+        route_objective=getattr(args, "route_objective", "bce"),
+        evidence_available=evidence_available,
     )
     registry = {}
     total = denominators["task"]
@@ -478,7 +523,12 @@ def _stage2_loss(
         total = total + args.disentangle_weight * disentangle
         _add_loss(registry, "disentangle", disentangle)
     _add_loss(registry, "total", total)
-    return total, registry
+    components = {
+        "task": denominators["task"],
+        "route": denominators["route"],
+        "kd": denominators["kd"],
+    }
+    return total, registry, components
 
 
 def _build_teacher_model(args, adim: int, tdim: int, vdim: int) -> ComP:
@@ -533,7 +583,7 @@ def _load_teacher(
 
 
 def _build_student(args, device: torch.device, adim: int, tdim: int, vdim: int, evidence_dim: int):
-    use_router = args.per_mode in {"task_router", "teacher_router"}
+    use_router = args.per_mode in {"fixed", "task_router", "teacher_router"}
     model = PERStudent(
         args,
         adim,
@@ -567,6 +617,7 @@ def _teacher_terms(
         output.evidence,
         student_batch.labels,
     )
+    evidence_available = evidence.mask.any(dim=-1).unsqueeze(-1).expand(-1, -1, 3)
     target = build_route_target(
         scores.utility[:, :, :, 0],
         scores.utility[:, :, :, 1],
@@ -577,11 +628,13 @@ def _teacher_terms(
             device=scores.utility.device,
         ),
         scores.confidence,
+        evidence_available=evidence_available,
     )
     teacher_logits = teacher.full_view_logits(
         full_batch.features, full_batch.sequence_mask
     ) if args.kd_weight > 0 else None
-    return target, teacher_logits
+    utility_gap = scores.utility[:, :, :, 1] - scores.utility[:, :, :, 0]
+    return target, teacher_logits, utility_gap
 
 
 def train_epoch(
@@ -597,9 +650,14 @@ def train_epoch(
     device: torch.device,
     first_stage: bool,
     epoch: int,
+    router_warmup_active: bool = False,
 ) -> Dict[str, float]:
     model.train()
     registry: Dict[str, float] = {}
+    diagnostics = RouteDiagnosticsAccumulator()
+    evidence_coverage = EvidenceCoverageAccumulator()
+    grad_registry: Dict[str, float] = {}
+    grad_diag_batches = 0
     seen_batches = 0
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed + epoch * 1009)
@@ -617,6 +675,7 @@ def train_epoch(
                 generator=generator,
             )
         batch.evidence = evidence
+        evidence_coverage.add(evidence, batch.availability, batch.sequence_mask)
         optimizer.zero_grad(set_to_none=True)
         if first_stage:
             outputs = model.stage1_forward(batch.features, batch.availability, batch.labels)
@@ -632,13 +691,21 @@ def train_epoch(
             )
             route_target = None
             teacher_logits = None
+            utility_gap = None
             if args.per_mode == "teacher_router":
                 if teacher is None:
                     raise RuntimeError("teacher_router mode has no teacher")
-                route_target, teacher_logits = _teacher_terms(
+                route_target, teacher_logits, utility_gap = _teacher_terms(
                     teacher, output, batch, full_batch, args
                 )
-            total, batch_registry = _stage2_loss(
+            if model.use_router:
+                diagnostics.add(
+                    output,
+                    batch,
+                    route_target=route_target,
+                    utility_gap=utility_gap,
+                )
+            total, batch_registry, loss_components = _stage2_loss(
                 output,
                 batch,
                 _task_name(args.dataset),
@@ -650,7 +717,43 @@ def train_epoch(
             raise FloatingPointError(
                 f"non-finite total loss at epoch={epoch}, batch={seen_batches}"
             )
+        gradient_values = {}
+        interval = max(1, int(getattr(args, "route_gradient_interval", 20)))
+        if (
+            getattr(args, "route_gradient_diagnostics", False)
+            and not first_stage
+            and model.router is not None
+            and seen_batches % interval == 0
+        ):
+            gradient_values.update(
+                component_gradient_norms(
+                    args.route_weight * loss_components["route"],
+                    loss_components["task"],
+                    list(model.router.parameters()),
+                )
+            )
+            valid_route = (~batch.availability) & batch.sequence_mask.unsqueeze(-1)
+            if batch.evidence is not None:
+                valid_route &= batch.evidence.mask.any(dim=-1).unsqueeze(-1).expand(-1, -1, 3)
+            if route_target is not None and int(valid_route.sum()) > 1:
+                gradient_values["student_target_pearson"] = pearson(
+                    output.route[valid_route], route_target[valid_route]
+                )
+                gradient_values["student_target_spearman"] = spearman(
+                    output.route[valid_route], route_target[valid_route]
+                )
+            gradient_values["valid_route_positions"] = float(valid_route.sum())
         total.backward()
+        if gradient_values:
+            gradient_values["router_grad_norm"] = parameter_grad_norm(
+                model.router.parameters()
+            )
+            gradient_values["backbone_grad_norm"] = parameter_grad_norm(
+                model.backbone.parameters()
+            )
+            for name, value in gradient_values.items():
+                grad_registry[name] = grad_registry.get(name, 0.0) + float(value)
+            grad_diag_batches += 1
         if args.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
         optimizer.step()
@@ -658,7 +761,19 @@ def train_epoch(
             registry[name] = registry.get(name, 0.0) + value
         seen_batches += 1
     count = max(1, seen_batches)
-    return {name: value / count for name, value in registry.items()}
+    metrics = {name: value / count for name, value in registry.items()}
+    metrics.update(diagnostics.summary())
+    metrics.update(evidence_coverage.summary())
+    if grad_diag_batches:
+        metrics.update({
+            name: value / grad_diag_batches
+            for name, value in grad_registry.items()
+        })
+    metrics["route_bce"] = metrics.get("route", 0.0)
+    metrics["task_loss_total"] = metrics.get("task_joint", 0.0)
+    metrics["route_weight"] = float(args.route_weight)
+    metrics["router_warmup_active"] = float(router_warmup_active)
+    return metrics
 
 
 def _metrics(
@@ -719,6 +834,10 @@ def evaluate(
     all_masks = []
     total_loss = 0.0
     batch_count = 0
+    diagnostics = RouteDiagnosticsAccumulator()
+    evidence_coverage = EvidenceCoverageAccumulator()
+    evaluation_audit = EvaluationAuditAccumulator()
+    fusion_diagnostics = FusionDiagnosticsAccumulator()
     with torch.no_grad():
         for full_batch_cpu in loader:
             batch = _apply_manifest(full_batch_cpu, mask_manifest, device)
@@ -732,6 +851,9 @@ def evaluate(
                 evidence=evidence,
                 return_intermediates=True,
             )
+            if model.use_router:
+                diagnostics.add(output, batch)
+            fusion_diagnostics.add(output, batch)
             loss = masked_task_loss(
                 output.logits,
                 batch.labels,
@@ -745,14 +867,25 @@ def evaluate(
             all_labels.append(batch.labels)
             all_masks.append(batch.sequence_mask)
             if _task_name(args.dataset) == "regression":
-                all_predictions.append(output.logits.squeeze(-1))
+                batch_predictions = output.logits.squeeze(-1)
             else:
-                all_predictions.append(output.logits.argmax(dim=-1))
+                batch_predictions = output.logits.argmax(dim=-1)
+            all_predictions.append(batch_predictions)
+            evaluation_audit.add(
+                batch.labels,
+                batch_predictions,
+                batch.availability,
+                batch.sequence_mask,
+            )
     labels = torch.cat(all_labels, dim=0)
     predictions = torch.cat(all_predictions, dim=0)
     sequence_mask = torch.cat(all_masks, dim=0)
     result = _metrics(labels, predictions, sequence_mask, args.dataset)
     result["loss"] = total_loss / max(1, batch_count)
+    result.update(diagnostics.summary())
+    result.update(evidence_coverage.summary())
+    result.update(evaluation_audit.summary(args.dataset))
+    result.update(fusion_diagnostics.summary())
     return result
 
 
@@ -767,6 +900,28 @@ def _set_requires_grad(module: Optional[torch.nn.Module], enabled: bool) -> None
         return
     for parameter in module.parameters():
         parameter.requires_grad_(enabled)
+
+
+def _configure_route_training(model, args, epoch: int, first_stage: bool) -> bool:
+    """Configure warmup without changing default training behavior."""
+    _set_requires_grad(
+        model.backbone, epoch >= int(getattr(args, "freeze_backbone_epochs", 0))
+    )
+    warmup_epochs = int(getattr(args, "router_warmup_epochs", 0))
+    warmup = (
+        not first_stage
+        and warmup_epochs > 0
+        and epoch < args.stage_epoch + warmup_epochs
+    )
+    if warmup and bool(getattr(args, "freeze_candidate_during_warmup", False)):
+        _set_requires_grad(model.backbone, False)
+        _set_requires_grad(model.evidence_encoder, False)
+        _set_requires_grad(model.observed_projections, False)
+    else:
+        _set_requires_grad(model.evidence_encoder, True)
+        _set_requires_grad(model.observed_projections, True)
+    _set_requires_grad(model.router, True)
+    return warmup
 
 
 def _save_checkpoint(
@@ -852,9 +1007,17 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
             missing_rate=args.mask_rate,
             protocol=args.missing_protocol,
         )
-        val_manifest_path = str(fold_dir / "val_mask_manifest.csv")
-        test_manifest_path = str(fold_dir / "test_mask_manifest.csv")
+        val_manifest_path = str(resolve_manifest_path(
+            getattr(args, "val_mask_manifest", None),
+            fold_dir / "val_mask_manifest.csv",
+        ))
+        test_manifest_path = str(resolve_manifest_path(
+            getattr(args, "test_mask_manifest", None),
+            fold_dir / "test_mask_manifest.csv",
+        ))
         if not Path(val_manifest_path).exists():
+            if getattr(args, "val_mask_manifest", None):
+                raise FileNotFoundError(val_manifest_path)
             _collect_split_masks(
                 val_loader,
                 val_sampler,
@@ -863,6 +1026,8 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
                 fixed_pattern=args.fixed_pattern,
             )
         if not Path(test_manifest_path).exists():
+            if getattr(args, "test_mask_manifest", None):
+                raise FileNotFoundError(test_manifest_path)
             _collect_split_masks(
                 test_loader,
                 test_sampler,
@@ -872,6 +1037,8 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
             )
         val_manifest = MaskManifest.load(val_manifest_path)
         test_manifest = MaskManifest.load(test_manifest_path)
+        val_mask_sha256 = sha256_file(val_manifest_path)
+        test_mask_sha256 = sha256_file(test_manifest_path)
 
         model = _build_student(args, device, adim, tdim, vdim, evidence_dim)
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -894,8 +1061,8 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
         history = []
         for epoch in range(args.epochs):
             first_stage = epoch < args.stage_epoch
-            _set_requires_grad(
-                model.backbone, epoch >= args.freeze_backbone_epochs
+            router_warmup_active = _configure_route_training(
+                model, args, epoch, first_stage
             )
             train_sampler.set_epoch(epoch)
             train_manifest_path = (
@@ -923,6 +1090,7 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
                 device,
                 first_stage,
                 epoch,
+                router_warmup_active=router_warmup_active,
             )
             val_metrics = evaluate(
                 model,
@@ -984,6 +1152,8 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
             "checkpoint": str(checkpoint_path),
             "val_mask_manifest": val_manifest_path,
             "test_mask_manifest": test_manifest_path,
+            "val_mask_sha256": val_mask_sha256,
+            "test_mask_sha256": test_mask_sha256,
             "parameter_count": parameter_count,
             "trainable_parameter_count": trainable_parameter_count,
         }
@@ -997,14 +1167,23 @@ def run_fair(args, device: torch.device) -> Dict[str, object]:
         "missing_protocol": args.missing_protocol,
         "per_mode": args.per_mode,
         "coordinator_mode": args.coordinator_mode,
+        "fixed_source_weight": args.fixed_source_weight,
+        "evidence_seed": args.seed,
+        "route_objective": args.route_objective,
+        "router_warmup_epochs": args.router_warmup_epochs,
+        "freeze_candidate_during_warmup": args.freeze_candidate_during_warmup,
         "evidence_mode": args.evidence_mode,
-        "evidence_description": (
-            "training-only feature-neighbor evidence; not semantic KB evidence"
-            if args.evidence_mode == "feature"
-            else "empty evidence / prompt-only fallback"
-        ),
+        "evidence_description": {
+            "feature": "training-only feature-neighbor evidence; not semantic KB evidence",
+            "empty": "empty evidence / prompt-only fallback",
+            "random": "deterministic random training-bank evidence",
+            "shuffled": "deterministically shuffled evidence",
+            "source_only": "zero-content evidence with source availability retained",
+        }[args.evidence_mode],
         "dataset_version": args.dataset_version,
         "teacher_checkpoint_template": args.teacher_checkpoint,
+        "val_mask_manifest_override": getattr(args, "val_mask_manifest", None),
+        "test_mask_manifest_override": getattr(args, "test_mask_manifest", None),
         "folds": all_results,
     }
     _write_json(run_dir / "summary.json", summary)
@@ -1055,7 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-mode", choices=PER_MODES, default="task_router")
     parser.add_argument("--missing-protocol", choices=("categorical", "bernoulli"), default="categorical")
     parser.add_argument("--fixed-pattern", type=int, nargs=3, default=None)
-    parser.add_argument("--evidence-mode", choices=("empty", "feature"), default="feature")
+    parser.add_argument("--evidence-mode", choices=("empty", "feature", "random", "shuffled", "source_only"), default="feature")
     parser.add_argument("--coordinator-mode", choices=("on", "fixed", "off"), default="on")
     parser.add_argument("--coordinator-fixed-weights", type=float, nargs=3, default=None)
     parser.add_argument("--fix-private-branch", action="store_true", default=True)
@@ -1086,10 +1265,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-save-train-masks", dest="save_train_masks", action="store_false")
 
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--val-mask-manifest", type=str, default=None)
+    parser.add_argument("--test-mask-manifest", type=str, default=None)
     parser.add_argument("--router-hidden", type=int, default=None)
     parser.add_argument("--router-dropout", type=float, default=0.0)
     parser.add_argument("--route-weight", type=float, default=0.5)
     parser.add_argument("--route-temperature", type=float, default=1.0)
+    parser.add_argument("--route-objective", choices=("bce", "smooth_l1"), default="bce")
+    parser.add_argument("--route-gradient-diagnostics", action="store_true", default=False)
+    parser.add_argument("--route-gradient-interval", type=int, default=20)
+    parser.add_argument("--router-warmup-epochs", type=int, default=0)
+    parser.add_argument("--freeze-candidate-during-warmup", action="store_true", default=False)
+    parser.add_argument("--fixed-source-weight", type=float, default=0.5)
     parser.add_argument("--kd-weight", type=float, default=0.0)
     parser.add_argument("--kd-temperature", type=float, default=2.0)
     parser.add_argument("--evidence-dropout", type=float, default=0.0)
@@ -1141,9 +1328,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.evidence_mode = "empty"
     if args.per_mode == "teacher_router" and not args.teacher_checkpoint:
         parser.error("--per-mode teacher_router requires --teacher-checkpoint")
+    if not 0.0 <= args.fixed_source_weight <= 1.0:
+        parser.error("--fixed-source-weight must be in [0,1]")
+    if args.router_warmup_epochs < 0:
+        parser.error("--router-warmup-epochs must be non-negative")
+    if args.route_gradient_interval <= 0:
+        parser.error("--route-gradient-interval must be positive")
     if args.per_mode == "generated" and args.evidence_mode != "empty":
         parser.error("--per-mode generated does not use external evidence")
-    if args.per_mode in {"task_router", "teacher_router"} and args.evidence_mode == "empty":
+    if args.per_mode in {"fixed", "task_router", "teacher_router"} and args.evidence_mode == "empty":
         print(
             "WARNING: task/teacher router has no evidence; empty evidence forces "
             "fallback to prompt candidates.",

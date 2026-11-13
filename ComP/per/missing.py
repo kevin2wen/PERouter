@@ -90,6 +90,7 @@ class MissingPatternSampler:
                 raise ValueError("pattern_probabilities must have positive sum")
             probabilities = probabilities / total
         self.pattern_probabilities = probabilities.cpu()
+        self._uses_explicit_probabilities = pattern_probabilities is not None
 
     def _empty(self, sequence_mask: torch.BoolTensor) -> torch.BoolTensor:
         return torch.zeros(
@@ -103,21 +104,101 @@ class MissingPatternSampler:
         epoch: int,
     ) -> torch.BoolTensor:
         availability = self._empty(sequence_mask)
-        probabilities = self.pattern_probabilities
+
+        # Explicit probabilities retain the original seven-pattern behavior.
+        # The default path maps mask_rate to an expected missing-modality count.
+        if self._uses_explicit_probabilities:
+            probabilities = self.pattern_probabilities
+            patterns = torch.tensor(self.allowed_patterns, dtype=torch.bool)
+            for batch_index, sample_id in enumerate(sample_ids):
+                valid = sequence_mask[batch_index]
+                n_valid = int(valid.sum().item())
+                if n_valid == 0:
+                    continue
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(
+                    _record_seed(self.seed, epoch, sample_id, "categorical")
+                )
+                choices = torch.multinomial(
+                    probabilities,
+                    num_samples=n_valid,
+                    replacement=True,
+                    generator=generator,
+                )
+                availability[batch_index, valid] = patterns[choices].to(
+                    availability.device
+                )
+            return availability
+
+        patterns_by_missing_count = {}
+        for pattern in self.allowed_patterns:
+            missing_count = 3 - sum(pattern)
+            patterns_by_missing_count.setdefault(missing_count, []).append(pattern)
+
+        available_counts = sorted(patterns_by_missing_count)
+        if not available_counts:
+            raise ValueError("allowed_patterns has no usable pattern")
+
+        # There are at most two missing modalities because all-missing rows are
+        # forbidden. Average missing fraction therefore saturates at 2/3.
+        target_missing_count = min(2.0, max(0.0, 3.0 * self.missing_rate))
+        lower_target = int(target_missing_count)
+        upper_target = int(target_missing_count) + 1
+        if upper_target > 2:
+            upper_target = lower_target
+        fraction_to_upper = target_missing_count - lower_target
+
+        lower_count = min(
+            available_counts,
+            key=lambda count: (abs(count - lower_target), count),
+        )
+        upper_count = min(
+            available_counts,
+            key=lambda count: (abs(count - upper_target), count),
+        )
+
         for batch_index, sample_id in enumerate(sample_ids):
             valid = sequence_mask[batch_index]
             n_valid = int(valid.sum().item())
             if n_valid == 0:
                 continue
             generator = torch.Generator(device="cpu")
-            generator.manual_seed(_record_seed(self.seed, epoch, sample_id, "categorical"))
-            choices = torch.multinomial(
-                probabilities, num_samples=n_valid, replacement=True, generator=generator
+            generator.manual_seed(
+                _record_seed(self.seed, epoch, sample_id, "categorical")
             )
-            patterns = torch.tensor(self.allowed_patterns, dtype=torch.bool)
-            availability[batch_index, valid] = patterns[choices].to(
-                availability.device
-            )
+
+            if lower_count == upper_count or fraction_to_upper <= 0:
+                missing_counts = torch.full(
+                    (n_valid,), lower_count, dtype=torch.int64
+                )
+            else:
+                choose_upper = torch.rand(
+                    (n_valid,), generator=generator
+                ) < fraction_to_upper
+                missing_counts = torch.where(
+                    choose_upper,
+                    torch.full((n_valid,), upper_count, dtype=torch.int64),
+                    torch.full((n_valid,), lower_count, dtype=torch.int64),
+                )
+
+            for missing_count in torch.unique(missing_counts).tolist():
+                row_indices = torch.nonzero(
+                    missing_counts == missing_count, as_tuple=False
+                ).flatten()
+                candidates = patterns_by_missing_count[int(missing_count)]
+                candidate_tensor = torch.tensor(candidates, dtype=torch.bool)
+                choices = torch.randint(
+                    0,
+                    len(candidates),
+                    (row_indices.numel(),),
+                    generator=generator,
+                )
+                selected_valid = torch.nonzero(valid, as_tuple=False).flatten()
+                selected_rows = selected_valid[row_indices]
+                availability[batch_index, selected_rows] = candidate_tensor[
+                    choices
+                ].to(availability.device)
+
         return availability
 
     def _sample_bernoulli(

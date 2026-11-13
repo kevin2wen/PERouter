@@ -85,7 +85,7 @@ class CompleteViewTeacher(nn.Module):
 
         def fuse(prompts, _mask):
             result = dict(prompts)
-            replace = availability[:, :, target_modality_index].unsqueeze(-1)
+            replace = (~availability[:, :, target_modality_index]).unsqueeze(-1)
             result[target_name] = torch.where(
                 replace, candidate[target_name], prompts[target_name]
             )

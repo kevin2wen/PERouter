@@ -118,7 +118,14 @@ class FeatureNeighborRetriever:
         modality_dims: Dict[str, int],
         top_k: int,
         device: Optional[torch.device] = None,
+        *,
+        exclude_same_utterance: bool = True,
+        exclude_same_video: bool = False,
+        exclude_same_dialogue: bool = False,
+        exclude_same_speaker: bool = False,
     ):
+        if exclude_same_speaker:
+            raise NotImplementedError("same-speaker metadata is unavailable for CMU-MOSI")
         if top_k <= 0:
             raise ValueError("top_k must be positive")
         if set(modality_dims) != set(MODALITIES):
@@ -126,6 +133,10 @@ class FeatureNeighborRetriever:
         self.modality_dims = {name: int(value) for name, value in modality_dims.items()}
         self.top_k = int(top_k)
         self.device = torch.device(device or "cpu")
+        self.exclude_same_utterance = bool(exclude_same_utterance)
+        self.exclude_same_video = bool(exclude_same_video)
+        self.exclude_same_dialogue = bool(exclude_same_dialogue)
+        self.exclude_same_speaker = bool(exclude_same_speaker)
         self._vectors: Dict[str, List[torch.Tensor]] = {
             modality: [] for modality in MODALITIES
         }
@@ -270,19 +281,27 @@ class FeatureNeighborRetriever:
                     query = F.normalize(query, p=2, dim=-1)
                     similarities.append(torch.mv(bank_norm[modality], query))
                 similarity = torch.stack(similarities).mean(dim=0)
-                same_item = torch.tensor(
+                same_sample = torch.tensor(
+                    [sample == str(sample_ids[batch_index]) for sample in self._sample_ids],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                same_utterance = torch.tensor(
                     [
                         sample == str(sample_ids[batch_index])
                         and utterance == str(utterance_ids[batch_index][time_index])
-                        for sample, utterance in zip(
-                            self._sample_ids, self._utterance_ids
-                        )
+                        for sample, utterance in zip(self._sample_ids, self._utterance_ids)
                     ],
                     dtype=torch.bool,
                     device=self.device,
                 )
-                similarity = similarity.masked_fill(same_item, float("-inf"))
-                valid_count = min(k, int((~same_item).sum().item()))
+                blocked = torch.zeros_like(same_sample)
+                if self.exclude_same_utterance:
+                    blocked |= same_utterance
+                if self.exclude_same_video or self.exclude_same_dialogue:
+                    blocked |= same_sample
+                similarity = similarity.masked_fill(blocked, float("-inf"))
+                valid_count = min(k, int((~blocked).sum().item()))
                 if valid_count == 0:
                     continue
                 values, indices = torch.topk(similarity, k=valid_count)
@@ -393,4 +412,202 @@ def perturb_evidence(
         mask=mask,
         source_confidence=confidence,
         conflict_score=conflict,
+    )
+
+
+def source_only_evidence(evidence: EvidenceBatch) -> EvidenceBatch:
+    """Zero evidence content while preserving availability and confidence."""
+    return EvidenceBatch(
+        ids=[list(row) for row in evidence.ids],
+        features=torch.zeros_like(evidence.features),
+        mask=evidence.mask.clone(),
+        source_confidence=evidence.source_confidence.clone(),
+        conflict_score=(
+            evidence.conflict_score.clone()
+            if evidence.conflict_score is not None
+            else None
+        ),
+    )
+
+
+def shuffled_evidence(
+    evidence: EvidenceBatch,
+    seed: int,
+    *,
+    query_sample_ids: Optional[Sequence[str]] = None,
+) -> EvidenceBatch:
+    """Deterministically permute whole evidence rows across the batch."""
+    batch_size = evidence.features.size(0)
+    if batch_size <= 1:
+        result = EvidenceBatch(
+            ids=[list(row) for row in evidence.ids],
+            features=evidence.features.clone(),
+            mask=evidence.mask.clone(),
+            source_confidence=evidence.source_confidence.clone(),
+            conflict_score=(
+                evidence.conflict_score.clone()
+                if evidence.conflict_score is not None
+                else None
+            ),
+        )
+    elif query_sample_ids is None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        permutation = torch.randperm(batch_size, generator=generator)
+    else:
+        if len(query_sample_ids) != batch_size:
+            raise ValueError("query_sample_ids must match batch size")
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        priority = torch.rand(batch_size, generator=generator)
+        destination_order = torch.argsort(priority, descending=True).tolist()
+        available = set(range(batch_size))
+        selected = [None] * batch_size
+        for destination in destination_order:
+            choices = [
+                source
+                for source in available
+                if str(query_sample_ids[source])
+                != str(query_sample_ids[destination])
+            ]
+            if not choices:
+                choices = list(available)
+            source = max(choices, key=lambda value: (float(priority[value]), -value))
+            selected[destination] = source
+            available.remove(source)
+        permutation = torch.tensor(selected, dtype=torch.long)
+    if batch_size > 1:
+        device = evidence.features.device
+        permutation = permutation.to(device)
+        result = EvidenceBatch(
+            ids=[evidence.ids[index] for index in permutation.cpu().tolist()],
+            features=evidence.features[permutation],
+            mask=evidence.mask[permutation],
+            source_confidence=evidence.source_confidence[permutation],
+            conflict_score=(
+                evidence.conflict_score[permutation]
+                if evidence.conflict_score is not None
+                else None
+            ),
+        )
+    if query_sample_ids is not None:
+        mask = result.mask.clone()
+        ids = [[list(rank_ids) for rank_ids in row] for row in result.ids]
+        for batch_index, sample_id in enumerate(query_sample_ids):
+            for time_index in range(mask.size(1)):
+                for rank in range(mask.size(2)):
+                    neighbor = ids[batch_index][time_index][rank]
+                    owner = neighbor.partition(":")[0] if neighbor else ""
+                    if owner == str(sample_id):
+                        mask[batch_index, time_index, rank] = False
+                        ids[batch_index][time_index][rank] = ""
+        result = EvidenceBatch(
+            ids=ids,
+            features=result.features,
+            mask=mask,
+            source_confidence=result.source_confidence
+            * mask.to(result.source_confidence.dtype),
+            conflict_score=(
+                result.conflict_score * mask.to(result.conflict_score.dtype)
+                if result.conflict_score is not None
+                else None
+            ),
+        )
+    return result
+
+
+def randomize_evidence(
+    reference: EvidenceBatch,
+    retriever: FeatureNeighborRetriever,
+    seed: int,
+    *,
+    query_sample_ids: Optional[Sequence[str]] = None,
+) -> EvidenceBatch:
+    """Replace valid evidence with deterministic random training-bank rows."""
+    retriever._stack_bank()
+    retriever._ensure_index()
+    n_bank = len(retriever._sample_ids)
+    features = torch.zeros_like(reference.features)
+    mask = reference.mask.clone()
+    if n_bank == 0:
+        mask.zero_()
+        return EvidenceBatch(
+            ids=[[["" for _ in row] for row in sample] for sample in reference.ids],
+            features=features,
+            mask=mask,
+            source_confidence=reference.source_confidence.clone() * 0.0,
+            conflict_score=(
+                reference.conflict_score.clone() * 0.0
+                if reference.conflict_score is not None
+                else None
+            ),
+        )
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    valid_mask = mask.clone()
+    if query_sample_ids is None:
+        indices = torch.randint(
+            0,
+            n_bank,
+            tuple(reference.mask.shape),
+            generator=generator,
+            device="cpu",
+        )
+    else:
+        if len(query_sample_ids) != reference.mask.size(0):
+            raise ValueError("query_sample_ids must match batch size")
+        indices = torch.zeros(reference.mask.shape, dtype=torch.long)
+        for batch_index, sample_id in enumerate(query_sample_ids):
+            valid_bank = [
+                index
+                for index, bank_sample in enumerate(retriever._sample_ids)
+                if str(bank_sample) != str(sample_id)
+            ]
+            if not valid_bank:
+                valid_mask[batch_index] = False
+                continue
+            values = torch.tensor(valid_bank, dtype=torch.long)
+            sampled = values[
+                torch.randint(
+                    0,
+                    values.numel(),
+                    (reference.mask.size(1), reference.mask.size(2)),
+                    generator=generator,
+                )
+            ]
+            indices[batch_index] = sampled
+    assert retriever._bank_full is not None
+    selected = retriever._bank_full[indices].to(reference.features.device)
+    keep = valid_mask.unsqueeze(-1)
+    features = torch.where(keep, selected, features)
+    ids = []
+    for batch_index in range(reference.mask.size(0)):
+        sample_ids = []
+        for time_index in range(reference.mask.size(1)):
+            rank_ids = []
+            for rank in range(reference.mask.size(2)):
+                if bool(valid_mask[batch_index, time_index, rank]):
+                    bank_index = int(indices[batch_index, time_index, rank])
+                    rank_ids.append(
+                        f"{retriever._sample_ids[bank_index]}:"
+                        f"{retriever._utterance_ids[bank_index]}"
+                    )
+                else:
+                    rank_ids.append("")
+            sample_ids.append(rank_ids)
+        ids.append(sample_ids)
+    return EvidenceBatch(
+        ids=ids,
+        features=features,
+        mask=valid_mask,
+        source_confidence=reference.source_confidence * valid_mask.to(
+            reference.source_confidence.dtype
+        ),
+        conflict_score=(
+            reference.conflict_score
+            * valid_mask.to(reference.conflict_score.dtype)
+            if reference.conflict_score is not None
+            else None
+        ),
     )

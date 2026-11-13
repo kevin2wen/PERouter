@@ -27,7 +27,7 @@ class NoTeacherAtInferenceTest(unittest.TestCase):
         # The executable evaluator writes this explicit field; verifying the
         # field here prevents silently changing the deployment claim.
         source = Path(
-            "/Users/xuanqin/2026-AAAI-ComP/ComP/eval_per.py"
+            str(__import__("pathlib").Path(__file__).resolve().parents[1] / "ComP" / "eval_per.py")
         ).read_text(encoding="utf-8")
         self.assertIn('"teacher_used_at_inference": False', source)
 

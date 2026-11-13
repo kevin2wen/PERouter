@@ -15,6 +15,7 @@ def build_route_target(
     missing_mask: torch.BoolTensor,
     temperature: torch.Tensor,
     teacher_confidence: torch.Tensor,
+    evidence_available: Optional[torch.BoolTensor] = None,
 ) -> torch.Tensor:
     """Return detached [B,T,3] prompt/evidence targets.
 
@@ -37,7 +38,12 @@ def build_route_target(
         (evidence_utility - prompt_utility) / temperature_tensor
     )
     probability = 0.5 + confidence * (probability - 0.5)
-    target = torch.where(missing_mask, probability, torch.full_like(probability, 0.5))
+    valid = missing_mask
+    if evidence_available is not None:
+        if evidence_available.shape != missing_mask.shape:
+            raise ValueError("evidence_available must match missing mask [B,T,3]")
+        valid = valid & evidence_available.bool()
+    target = torch.where(valid, probability, torch.full_like(probability, 0.5))
     return target.detach()
 
 
@@ -46,11 +52,17 @@ def route_distillation_loss(
     target_route: torch.Tensor,
     missing_mask: torch.BoolTensor,
     sequence_mask: Optional[torch.BoolTensor] = None,
+    evidence_available: Optional[torch.BoolTensor] = None,
+    objective: str = "bce",
 ) -> torch.Tensor:
-    """BCE over valid missing utterance-modality positions only."""
+    """Route supervision over valid missing utterance-modality positions."""
     if route_logits.shape != target_route.shape or route_logits.shape != missing_mask.shape:
         raise ValueError("route_logits, target_route, missing_mask must be [B,T,3]")
     valid = missing_mask & torch.isfinite(target_route)
+    if evidence_available is not None:
+        if evidence_available.shape != route_logits.shape:
+            raise ValueError("evidence_available must be [B,T,3]")
+        valid = valid & evidence_available.bool()
     if sequence_mask is not None:
         if sequence_mask.shape != route_logits.shape[:2]:
             raise ValueError("sequence_mask must be [B,T]")
@@ -60,9 +72,16 @@ def route_distillation_loss(
         # Keep the graph while returning exactly zero when no missing position
         # exists in this batch.
         return route_logits.sum() * 0.0
-    raw = F.binary_cross_entropy_with_logits(
-        route_logits[valid], target_route[valid].detach(), reduction="sum"
-    )
+    target = target_route[valid].detach()
+    if objective == "bce":
+        raw = F.binary_cross_entropy_with_logits(
+            route_logits[valid], target, reduction="sum"
+        )
+    elif objective == "smooth_l1":
+        probability = torch.sigmoid(route_logits[valid])
+        raw = F.smooth_l1_loss(probability, target, reduction="sum")
+    else:
+        raise ValueError(f"unsupported route objective: {objective}")
     return raw / denominator.to(raw.dtype)
 
 
@@ -129,6 +148,8 @@ def masked_task_loss(
     if task == "regression":
         return MaskedMSELoss()(prediction, labels, sequence_mask)
     if task == "classification":
+        prediction = prediction.reshape(-1, prediction.size(-1))
+        labels = labels.reshape(-1)
         return MaskedCELoss()(prediction, labels, sequence_mask)
     raise ValueError(f"unknown task: {task}")
 
@@ -144,6 +165,8 @@ def per_loss(
     lambda_kd: float = 0.1,
     kd_temperature: float = 2.0,
     sequence_mask: Optional[torch.BoolTensor] = None,
+    route_objective: str = "bce",
+    evidence_available: Optional[torch.BoolTensor] = None,
 ) -> Dict[str, torch.Tensor]:
     sequence_mask = (
         torch.ones(missing_mask.shape[:2], dtype=torch.bool, device=missing_mask.device)
@@ -155,7 +178,12 @@ def per_loss(
     route_loss = zero
     if route_target is not None:
         route_loss = route_distillation_loss(
-            output.route_logits, route_target, missing_mask, sequence_mask
+            output.route_logits,
+            route_target,
+            missing_mask,
+            sequence_mask,
+            evidence_available=evidence_available,
+            objective=route_objective,
         )
     kd_loss = zero
     if teacher_logits is not None:

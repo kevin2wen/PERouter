@@ -87,8 +87,31 @@ class EvidenceBatch:
             raise ValueError("evidence features and mask must share a device")
         if self.source_confidence.device != self.mask.device:
             raise ValueError("source_confidence must share the evidence device")
-        if self.conflict_score is not None and self.conflict_score.shape != (b, t, k):
-            raise ValueError("conflict_score must be [B,T,K]")
+        if not torch.isfinite(self.features).all():
+            raise FloatingPointError("evidence features contain non-finite values")
+        if (
+            self.source_confidence.dtype.is_complex
+            or not self.source_confidence.dtype.is_floating_point
+        ):
+            raise TypeError("source_confidence must be a real floating-point tensor")
+        if not torch.isfinite(self.source_confidence).all():
+            raise FloatingPointError("source_confidence contains non-finite values")
+        if ((self.source_confidence < 0) | (self.source_confidence > 1)).any():
+            raise ValueError("source_confidence must be in [0,1]")
+        if self.conflict_score is not None:
+            if self.conflict_score.shape != (b, t, k):
+                raise ValueError("conflict_score must be [B,T,K]")
+            if self.conflict_score.device != self.mask.device:
+                raise ValueError("conflict_score must share the evidence device")
+            if (
+                self.conflict_score.dtype.is_complex
+                or not self.conflict_score.dtype.is_floating_point
+            ):
+                raise TypeError("conflict_score must be a real floating-point tensor")
+            if not torch.isfinite(self.conflict_score).all():
+                raise FloatingPointError("conflict_score contains non-finite values")
+            if ((self.conflict_score < 0) | (self.conflict_score > 1)).any():
+                raise ValueError("conflict_score must be in [0,1]")
 
 
 @dataclass

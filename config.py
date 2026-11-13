@@ -17,13 +17,21 @@ def get_host_ip():
 
 ### Change the following DIRs to your own data directory before use. ###
 
+DATASET_ROOT = os.environ.get(
+    "PEROUTER_DATASET_ROOT",
+    '/home/xuanqin/Comp/datasets/ComP_clean',
+)
+
 DATA_DIR = { 
-	'CMUMOSI': '/data/hwj/EmotionRecognition/EmotionData/CMUMOSI',   
-	'CMUMOSEI': '/data/hwj/EmotionRecognition/EmotionData/CMUMOSEI',
-	'IEMOCAPSix': '/data/hwj/EmotionRecognition/EmotionData/IEMOCAP', 
-	'IEMOCAPFour': '/data/hwj/EmotionRecognition/EmotionData/IEMOCAP', 
+	'CMUMOSI': os.path.join(DATASET_ROOT, 'CMUMOSI'),
+	'CMUMOSEI': os.path.join(DATASET_ROOT, 'CMUMOSEI'),
+	'IEMOCAPSix': os.path.join(DATASET_ROOT, 'IEMOCAP'),
+	'IEMOCAPFour': os.path.join(DATASET_ROOT, 'IEMOCAP'),
 }
-SAVED_ROOT = os.path.join('/data/hwj/EmotionRecognition/CeP-IMER/saved/')
+SAVED_ROOT = os.environ.get(
+	'PEROUTER_SAVED_ROOT',
+	'/home/xuanqin/PERouter/runs/comP_saved/',
+)
 
 
 ### Your don't need to change the following. ###
