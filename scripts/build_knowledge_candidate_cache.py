@@ -23,7 +23,7 @@ from ComP.knowledge.retriever import KnowledgeContextRetriever
 from ComP.per.batch import PERDatasetAdapter
 from ComP.per.missing import MaskManifest
 from ComP.per.types import MODALITIES
-from ComP.train_knowledge import build_pipeline
+from ComP.train_knowledge import _build_knowledge_student, build_pipeline
 from ComP.train_per import (
     _apply_manifest,
     _build_student,
@@ -130,8 +130,15 @@ def main() -> int:
     projector.load_state_dict(adapter["projector"], strict=True)
     projector.to(device)
     projector.eval()
-    model = _build_student(args, device, adim, tdim, vdim, evidence_dim)
-    model.load_state_dict(student["model"], strict=True)
+    model = _build_knowledge_student(
+        args, device, adim, tdim, vdim, evidence_dim, student
+    )
+    encoder_state = adapter.get("evidence_encoder")
+    if encoder_state is None:
+        raise ValueError(
+            "card adapter checkpoint has no evidence_encoder state"
+        )
+    model.evidence_encoder.load_state_dict(encoder_state, strict=True)
     model.eval()
     model.requires_grad_(False)
     manifest = MaskManifest.load(cli.mask_manifest)
