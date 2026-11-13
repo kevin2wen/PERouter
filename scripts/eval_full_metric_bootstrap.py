@@ -122,7 +122,18 @@ def main() -> int:
         clusters = per_cluster_metric_delta(
             rows, comparison, baseline, metric="mae"
         )
-        wild = wild_cluster_bootstrap(clusters, n_boot=args.n_boot, seed=args.seed)
+        sizes = {
+            cluster: sum(
+                1
+                for row in rows
+                if row["mode"] == comparison
+                and row["dialogue_id"] == cluster
+            )
+            for cluster in clusters
+        }
+        wild = wild_cluster_bootstrap(
+            clusters, weights=sizes, n_boot=args.n_boot, seed=args.seed
+        )
         wild_rows.append(
             {
                 "comparison": comparison,

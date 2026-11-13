@@ -138,6 +138,7 @@ def paired_cluster_bootstrap(
 
 def wild_cluster_bootstrap(
     per_cluster: Mapping[str, float],
+    weights: Mapping[str, float] | None = None,
     *,
     n_boot: int = 10000,
     seed: int = 66,
@@ -146,16 +147,26 @@ def wild_cluster_bootstrap(
     values = np.asarray(list(per_cluster.values()), dtype=np.float64)
     if values.size == 0:
         raise ValueError("no clusters for wild bootstrap")
-    observed = float(values.mean())
+    keys = list(per_cluster)
+    weights_array = (
+        np.asarray([weights[key] for key in keys], dtype=np.float64)
+        if weights is not None
+        else np.ones(values.size, dtype=np.float64)
+    )
+    total = float(weights_array.sum())
+    observed = float((values * weights_array).sum() / total)
     centered = values - observed
     rng = np.random.default_rng(seed)
     signs = rng.choice((-1.0, 1.0), size=(n_boot, values.size))
-    draws = observed + (signs * centered).mean(axis=1)
+    draws = observed + (signs * centered * weights_array).sum(axis=1) / total
     lo, hi = np.quantile(draws, [alpha / 2, 1 - alpha / 2])
+    p_value = float(np.mean(np.abs(draws - observed) >= abs(observed)))
     return {
-        "delta": observed,
+        "raw_delta": observed,
+        "null_centered_delta": observed,
         "wild_ci_low": float(lo),
         "wild_ci_high": float(hi),
+        "wild_p_value": p_value,
         "clusters": float(values.size),
     }
 

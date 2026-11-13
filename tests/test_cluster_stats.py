@@ -48,6 +48,8 @@ class ClusterStatsTest(unittest.TestCase):
         clusters = {"d1": -0.5, "d2": -0.3, "d3": -0.7}
         wild = wild_cluster_bootstrap(clusters, n_boot=500, seed=2)
         self.assertLess(wild["wild_ci_high"], 0.0)
+        self.assertAlmostEqual(wild["raw_delta"], -0.5)
+        self.assertLess(wild["wild_p_value"], 0.05)
         rows = []
         for cluster, delta in clusters.items():
             rows.append(row("base", cluster, f"{cluster}_0", 1.0, 1.0))
