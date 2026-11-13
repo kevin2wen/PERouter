@@ -128,8 +128,6 @@ def main() -> int:
     if cache.get("split") != "train":
         raise ValueError("candidate cache must use train split")
     data = prepare(cache)
-    if data["candidate_dim"] != data["prompt_dim"]:
-        raise ValueError("current reranker expects equal candidate and prompt dimensions")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fold_assignments = dialogue_folds(data["sample_ids"], cli.folds, cli.seed)
     output = Path(cli.output_dir)

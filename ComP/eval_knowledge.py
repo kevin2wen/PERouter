@@ -15,6 +15,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ComP.knowledge.encoder import RuleKnowledgeCardEncoder
+from ComP.knowledge.filter_features import (
+    FEATURE_DIM,
+    card_feature_vector,
+    card_index,
+)
 from ComP.knowledge.pipeline import (
     KnowledgeBatchResult,
     knowledge_forward,
@@ -75,6 +80,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--composite-lambda-cls", type=float, default=0.5)
     p.add_argument("--composite-lambda-flip", type=float, default=0.5)
+    p.add_argument("--structured-filter", action="store_true")
     return p
 
 
@@ -232,6 +238,7 @@ def select_result(
     method: str,
     rerankers,
     seed: int,
+    structured: bool = False,
 ):
     empty_vectors = {
         name: torch.zeros(
@@ -259,6 +266,7 @@ def select_result(
     missing_patterns = []
     candidate_masks = []
     positions = []
+    card_map = card_index(result.cards) if structured else {}
     for target_index, target in enumerate(MODALITIES):
         evidence = result.evidence_by_target[target]
         projected = model.evidence_encoder.projections[target](
@@ -270,9 +278,48 @@ def select_result(
                 if not bool(mask.any()):
                     continue
                 positions.append((batch_index, time_index, target_index, target))
-                candidate_vectors.append(
-                    projected[batch_index, time_index]
-                )
+                if structured:
+                    rows = []
+                    for rank in range(mask.size(-1)):
+                        card = card_map.get(
+                            str(evidence.ids[batch_index][time_index][rank])
+                        )
+                        if card is None:
+                            rows.append([0.0] * FEATURE_DIM)
+                            continue
+                        rows.append(
+                            card_feature_vector(
+                                card,
+                                target=target,
+                                missing_pattern=(
+                                    batch.availability[
+                                        batch_index, time_index
+                                    ].tolist()
+                                ),
+                                rank=rank,
+                                top_k=mask.size(-1),
+                                conflict_score=(
+                                    float(
+                                        evidence.conflict_score[
+                                            batch_index, time_index, rank
+                                        ]
+                                    )
+                                    if evidence.conflict_score is not None
+                                    else 0.0
+                                ),
+                            )
+                        )
+                    candidate_vectors.append(
+                        torch.tensor(
+                            rows,
+                            dtype=projected.dtype,
+                            device=projected.device,
+                        )
+                    )
+                else:
+                    candidate_vectors.append(
+                        projected[batch_index, time_index]
+                    )
                 prompt_vectors.append(
                     prompt_output.prompt_candidates[target][batch_index, time_index]
                 )
@@ -643,6 +690,7 @@ def main() -> int:
                         method=cli.mode,
                         rerankers=rerankers,
                         seed=cli.seed + batch_index,
+                        structured=cli.structured_filter,
                     )
                     action_rows.extend(selected_rows)
                 output = knowledge_forward(

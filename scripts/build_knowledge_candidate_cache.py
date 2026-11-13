@@ -15,6 +15,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ComP.knowledge.audit import stable_hash
+from ComP.knowledge.filter_features import (
+    FEATURE_DIM,
+    card_feature_vector,
+    card_index,
+)
 from ComP.knowledge.pipeline import (
     KnowledgeBatchResult,
     knowledge_forward,
@@ -42,6 +47,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--gamma", type=float, default=0.5)
     p.add_argument("--min-helpful-gain", type=float, default=0.0)
     p.add_argument("--max-batches", type=int, default=0)
+    p.add_argument("--structured-features", action="store_true")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output", required=True)
     return p
@@ -159,6 +165,7 @@ def main() -> int:
         for full_cpu in train_loader:
             batch = _apply_manifest(full_cpu, manifest, device)
             result = pipeline.build(batch)
+            card_map = card_index(result.cards)
             empty_vectors = {
                 name: torch.zeros(
                     *batch.sequence_mask.shape,
@@ -234,11 +241,58 @@ def main() -> int:
                                 ),
                             }
                         )
-                        candidate_vectors.append(
-                            projected_by_target[target][
-                                batch_index, time_index
-                            ].detach().cpu()
-                        )
+                        if not cli.structured_features:
+                            candidate_vectors.append(
+                                projected_by_target[target][
+                                    batch_index, time_index
+                                ].detach().cpu()
+                            )
+                        else:
+                            cards = card_map
+                            rows = []
+                            for rank in range(args.top_k):
+                                card = cards.get(
+                                    str(
+                                        evidence.ids[batch_index][
+                                            time_index
+                                        ][rank]
+                                    )
+                                )
+                                if card is None:
+                                    rows.append(
+                                        [0.0] * FEATURE_DIM
+                                    )
+                                    continue
+                                rows.append(
+                                    card_feature_vector(
+                                        card,
+                                        target=target,
+                                        missing_pattern=(
+                                            batch.availability[
+                                                batch_index, time_index
+                                            ].tolist()
+                                        ),
+                                        rank=rank,
+                                        top_k=args.top_k,
+                                        conflict_score=(
+                                            float(
+                                                evidence.conflict_score[
+                                                    batch_index,
+                                                    time_index,
+                                                    rank,
+                                                ]
+                                            )
+                                            if evidence.conflict_score
+                                            is not None
+                                            else 0.0
+                                        ),
+                                    )
+                                )
+                            candidate_vectors.append(
+                                torch.tensor(
+                                    rows, dtype=torch.float32
+                                )
+                            )
                         prompt_vectors.append(
                             prompt_output.prompt_candidates[target][
                                 batch_index, time_index
@@ -304,6 +358,7 @@ def main() -> int:
         "exclusion_policy": "utterance+video+dialogue",
         "schema_version": "knowledge-card-v1",
         "min_helpful_gain": cli.min_helpful_gain,
+        "structured_features": bool(cli.structured_features),
     }
     cache_key = stable_hash(key_payload)
     cache = {
