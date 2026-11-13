@@ -179,6 +179,49 @@ def evaluate_card_model(
     return metrics
 
 
+def _build_knowledge_student(
+    args,
+    device,
+    adim: int,
+    tdim: int,
+    vdim: int,
+    evidence_dim: int,
+    payload: Dict[str, object],
+):
+    """Attach the PER evidence branch to a frozen fair-B0 student.
+
+    Fair B0 checkpoints are trained with ``per_mode=off`` and therefore carry
+    no ``evidence_encoder``. The knowledge route injects target-specific
+    evidence vectors, so the branch must exist. Rebuild with ``per_mode=fixed``
+    (the deterministic route is overridden per position later) and load the
+    checkpoint non-strictly, accepting only the newly introduced branch keys
+    as missing.
+    """
+    from argparse import Namespace
+
+    build_args = Namespace(**vars(args))
+    build_args.per_mode = "fixed"
+    build_args.fixed_source_weight = float(
+        getattr(args, "fixed_source_weight", 0.5)
+    )
+    model = _build_student(build_args, device, adim, tdim, vdim, evidence_dim)
+    incompatible = model.load_state_dict(payload["model"], strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "student checkpoint has unexpected keys: "
+            f"{list(incompatible.unexpected_keys)[:8]}"
+        )
+    allowed_prefixes = ("evidence_encoder.", "observed_projections.", "router.")
+    for key in incompatible.missing_keys:
+        if not key.startswith(allowed_prefixes):
+            raise RuntimeError(
+                f"student checkpoint misses non-branch parameter: {key}"
+            )
+    if getattr(model, "evidence_encoder", None) is None:
+        raise RuntimeError("failed to attach PER evidence encoder")
+    return model
+
+
 def main() -> int:
     cli = parser().parse_args()
     if cli.epochs <= 0:
@@ -225,12 +268,15 @@ def main() -> int:
     if cli.knowledge_index and not Path(cli.knowledge_index).exists():
         bank.save(cli.knowledge_index)
     projector.to(device)
-    model = _build_student(args, device, adim, tdim, vdim, evidence_dim)
-    model.load_state_dict(payload["model"], strict=True)
+    model = _build_knowledge_student(
+        args, device, adim, tdim, vdim, evidence_dim, payload
+    )
     model.eval()
     model.requires_grad_(False)
+    model.evidence_encoder.requires_grad_(True)
     optimizer = torch.optim.Adam(
-        projector.parameters(),
+        list(projector.parameters())
+        + list(model.evidence_encoder.parameters()),
         lr=cli.learning_rate,
         weight_decay=cli.weight_decay,
     )
@@ -283,7 +329,11 @@ def main() -> int:
                 raise FloatingPointError("non-finite knowledge adapter loss")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(projector.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(projector.parameters())
+                + list(model.evidence_encoder.parameters()),
+                5.0,
+            )
             optimizer.step()
             total += float(loss.detach().item())
             count += 1
@@ -312,6 +362,7 @@ def main() -> int:
             stale = 0
             checkpoint = {
                 "projector": projector.state_dict(),
+                "evidence_encoder": model.evidence_encoder.state_dict(),
                 "epoch": epoch,
                 "metrics": val_metrics,
                 "args": {
@@ -329,6 +380,7 @@ def main() -> int:
                         cli.student_checkpoint
                     ),
                     "source_fingerprint": bank.source_fingerprint(),
+                    "build_per_mode": "fixed",
                 },
                 "format_version": 1,
             }
@@ -345,6 +397,9 @@ def main() -> int:
         "history": history,
         "projector_parameter_count": sum(
             parameter.numel() for parameter in projector.parameters()
+        ),
+        "evidence_encoder_parameter_count": sum(
+            parameter.numel() for parameter in model.evidence_encoder.parameters()
         ),
         "test_accessed": False,
         "created_at": datetime.datetime.now().isoformat(),

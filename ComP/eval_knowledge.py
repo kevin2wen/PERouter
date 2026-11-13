@@ -27,7 +27,7 @@ from ComP.per.losses import masked_task_loss
 from ComP.per.missing import MaskManifest
 from ComP.per.types import MODALITIES, EvidenceBatch
 from ComP.knowledge.retriever import KnowledgeContextRetriever
-from ComP.train_knowledge import build_pipeline
+from ComP.train_knowledge import _build_knowledge_student, build_pipeline
 from ComP.train_per import (
     _apply_manifest,
     _build_student,
@@ -457,11 +457,20 @@ def main() -> int:
         PERDatasetAdapter(dataset, split[split_key]), args, training=False
     )
     evidence_dim = adim + tdim + vdim
-    model = _build_student(args, device, adim, tdim, vdim, evidence_dim)
-    model.load_state_dict(student["model"], strict=True)
+    model = _build_knowledge_student(
+        args, device, adim, tdim, vdim, evidence_dim, student
+    )
     model.eval()
     pipeline = None
     retriever = None
+    adapter_payload = None
+    if cli.card_adapter_checkpoint and Path(cli.card_adapter_checkpoint).exists():
+        adapter_payload = torch.load(
+            cli.card_adapter_checkpoint, map_location="cpu", weights_only=False
+        )
+        encoder_state = adapter_payload.get("evidence_encoder")
+        if encoder_state is not None:
+            model.evidence_encoder.load_state_dict(encoder_state, strict=True)
     card_modes = {
         "card",
         "random_card",
@@ -492,9 +501,10 @@ def main() -> int:
         )
         if not cli.card_adapter_checkpoint:
             raise ValueError("card modes require --card-adapter-checkpoint")
-        adapter_payload = torch.load(
-            cli.card_adapter_checkpoint, map_location="cpu", weights_only=False
-        )
+        if adapter_payload is None:
+            adapter_payload = torch.load(
+                cli.card_adapter_checkpoint, map_location="cpu", weights_only=False
+            )
         projector.load_state_dict(adapter_payload["projector"], strict=True)
         projector.to(device)
         projector.eval()
