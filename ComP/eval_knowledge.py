@@ -51,6 +51,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--mask-manifest", required=True)
     p.add_argument("--mode", choices=(
         "empty",
+        "zero_evidence",
         "raw_feature",
         "card",
         "random_card",
@@ -627,6 +628,55 @@ def main() -> int:
                     route_override=torch.zeros_like(batch.availability).to(
                         batch.features[MODALITIES[0]].dtype
                     ),
+                )
+            elif cli.mode == "zero_evidence":
+                batch_size, seq_len = batch.sequence_mask.shape
+                missing = (
+                    (~batch.availability)
+                    & batch.sequence_mask.unsqueeze(-1)
+                )
+                position_mask = missing[:, :, :1]
+                zero_evidence = EvidenceBatch(
+                    ids=[
+                        [[""] for _ in range(seq_len)]
+                        for _ in range(batch_size)
+                    ],
+                    features=torch.zeros(
+                        batch_size,
+                        seq_len,
+                        1,
+                        evidence_dim,
+                        dtype=batch.features[MODALITIES[0]].dtype,
+                        device=batch.features[MODALITIES[0]].device,
+                    ),
+                    mask=position_mask,
+                    source_confidence=torch.zeros(
+                        batch_size,
+                        seq_len,
+                        1,
+                        dtype=batch.features[MODALITIES[0]].dtype,
+                        device=batch.features[MODALITIES[0]].device,
+                    ),
+                )
+                output = model(
+                    batch.features,
+                    batch.availability,
+                    evidence=zero_evidence,
+                    return_intermediates=True,
+                    route_override=missing.to(
+                        batch.features[MODALITIES[0]].dtype
+                    )
+                    * float(cli.gamma),
+                    evidence_vectors_override={
+                        name: torch.zeros(
+                            batch_size,
+                            seq_len,
+                            model.dim,
+                            dtype=batch.features[MODALITIES[0]].dtype,
+                            device=batch.features[MODALITIES[0]].device,
+                        )
+                        for name in MODALITIES
+                    },
                 )
             elif cli.mode == "raw_feature":
                 evidence = retriever.retrieve(
