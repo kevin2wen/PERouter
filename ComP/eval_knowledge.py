@@ -27,6 +27,7 @@ from ComP.per.losses import masked_task_loss
 from ComP.per.missing import MaskManifest
 from ComP.per.types import MODALITIES, EvidenceBatch
 from ComP.knowledge.retriever import KnowledgeContextRetriever
+from ComP.knowledge.utility import oracle_utility
 from ComP.train_knowledge import _build_knowledge_student, build_pipeline
 from ComP.train_per import (
     _apply_manifest,
@@ -66,6 +67,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-batches", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--oracle-objective",
+        choices=("task", "mae", "acc", "composite"),
+        default="task",
+        help="Objective used by --mode oracle_card",
+    )
+    p.add_argument("--composite-lambda-cls", type=float, default=0.5)
+    p.add_argument("--composite-lambda-flip", type=float, default=0.5)
     return p
 
 
@@ -356,7 +365,14 @@ def oracle_card(
     *,
     gamma: float,
     task: str,
-) -> tuple[KnowledgeBatchResult, dict[str, torch.Tensor]]:
+    objective: str = "task",
+    lambda_cls: float = 0.5,
+    lambda_flip: float = 0.5,
+) -> tuple[
+    KnowledgeBatchResult,
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
     with torch.no_grad():
         skip_output = model(
             batch.features,
@@ -376,18 +392,42 @@ def oracle_card(
                 for name in MODALITIES
             },
         )
-        skip_loss = element_loss(skip_output, batch.labels, task)
+        skip_prediction = (
+            skip_output.logits.squeeze(-1)
+            if task == "regression"
+            else skip_output.logits.argmax(dim=-1)
+        )
+
+        def utility(output):
+            if objective == "task":
+                return -element_loss(output, batch.labels, task)
+            prediction = (
+                output.logits.squeeze(-1)
+                if task == "regression"
+                else output.logits.argmax(dim=-1)
+            )
+            return oracle_utility(
+                prediction,
+                batch.labels,
+                skip_prediction,
+                task=task,
+                objective=objective,
+                lambda_cls=lambda_cls,
+                lambda_flip=lambda_flip,
+            )
+
+        skip_utility = utility(skip_output)
         selected = {}
         best_rank = {}
         for target in MODALITIES:
-            best_gain = torch.zeros_like(skip_loss)
+            best_gain = torch.zeros_like(skip_utility)
             best = torch.full_like(batch.labels, -1, dtype=torch.long)
             for rank in range(result.evidence_by_target[target].mask.size(-1)):
                 isolated = isolate_rank(result, target, rank)
                 output = knowledge_forward(
                     model, batch, isolated, gamma=gamma
                 )
-                gain = skip_loss - element_loss(output, batch.labels, task)
+                gain = utility(output) - skip_utility
                 eligible = (
                     isolated.evidence_by_target[target].mask[:, :, rank]
                     & (~batch.availability[:, :, MODALITIES.index(target)])
@@ -423,6 +463,7 @@ def oracle_card(
                 chosen,
             ),
             best_rank,
+            selected,
         )
 
 
@@ -525,6 +566,7 @@ def main() -> int:
     losses = []
     oracle_rows = []
     action_rows = []
+    id_rows = []
     with torch.no_grad():
         for batch_index, full_cpu in enumerate(target_loader):
             batch = _apply_manifest(full_cpu, manifest, device)
@@ -566,8 +608,15 @@ def main() -> int:
                 elif cli.mode == "source_only":
                     result = source_only(result)
                 elif cli.mode == "oracle_card":
-                    result, gains = oracle_card(
-                        model, batch, result, gamma=cli.gamma, task=task
+                    result, gains, _ = oracle_card(
+                        model,
+                        batch,
+                        result,
+                        gamma=cli.gamma,
+                        task=task,
+                        objective=cli.oracle_objective,
+                        lambda_cls=cli.composite_lambda_cls,
+                        lambda_flip=cli.composite_lambda_flip,
                     )
                     for target, gain in gains.items():
                         active = (~batch.availability[:, :, MODALITIES.index(target)])
@@ -609,6 +658,12 @@ def main() -> int:
             labels_all.append(batch.labels.cpu())
             sequence_all.append(batch.sequence_mask.cpu())
             availability_all.append(batch.availability.cpu())
+            id_rows.append(
+                (
+                    list(batch.sample_ids),
+                    [list(utterances) for utterances in batch.utterance_ids],
+                )
+            )
             predictions_all.append(
                 (
                     output.logits.squeeze(-1)
@@ -634,10 +689,72 @@ def main() -> int:
     )
     output_dir = Path(cli.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    regression = task == "regression"
+    per_sample_rows = []
+    row_index = 0
+    for sample_ids, utterance_lists in id_rows:
+        for batch_index, sample_id in enumerate(sample_ids):
+            for time_index, utterance_id in enumerate(
+                utterance_lists[batch_index]
+            ):
+                if not bool(sequence_mask[row_index, time_index]):
+                    continue
+                label_value = float(labels[row_index, time_index])
+                if regression and label_value == 0.0:
+                    continue
+                prediction = float(predictions[row_index, time_index])
+                available = [
+                    bool(value)
+                    for value in availability[row_index, time_index].tolist()
+                ]
+                per_sample_rows.append(
+                    {
+                        "mode": cli.mode,
+                        "gamma": cli.gamma,
+                        "split": cli.split,
+                        "sample_id": sample_id,
+                        "dialogue_id": sample_id,
+                        "utterance_id": utterance_id,
+                        "availability": "".join(
+                            "1" if value else "0" for value in available
+                        ),
+                        "missing_count": 3 - sum(available),
+                        "label": label_value,
+                        "prediction": prediction,
+                        "abs_error": abs(prediction - label_value),
+                        "correct": int(
+                            (prediction > 0) == (label_value > 0)
+                        )
+                        if regression
+                        else int(prediction == label_value),
+                    }
+                )
+        row_index += len(sample_ids)
+    with (output_dir / "per_sample.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        fieldnames = (
+            "mode",
+            "gamma",
+            "split",
+            "sample_id",
+            "dialogue_id",
+            "utterance_id",
+            "availability",
+            "missing_count",
+            "label",
+            "prediction",
+            "abs_error",
+            "correct",
+        )
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(per_sample_rows)
     result = {
         "split": cli.split,
         "mode": cli.mode,
         "gamma": cli.gamma,
+        "oracle_objective": cli.oracle_objective,
         "metrics": metrics,
         "grouped_metrics": grouped,
         "student_checkpoint": cli.student_checkpoint,
