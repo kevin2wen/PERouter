@@ -91,7 +91,10 @@ def main() -> int:
     manifest = MaskManifest.load(args.mask_manifest)
     task = "regression" if cli.dataset in {"CMUMOSI", "CMUMOSEI"} else "classification"
     variants = ("predicted", "same_use_random", "state_only_confidence", "forced_top1")
-    store = {v: {"labels": [], "preds": [], "masks": []} for v in variants}
+    store = {
+        v: {"labels": [], "preds": [], "masks": [], "rows": []}
+        for v in variants
+    }
     with torch.no_grad():
         for full_cpu in val_loader:
             batch = _apply_manifest(full_cpu, manifest, device)
@@ -171,6 +174,28 @@ def main() -> int:
                 store[variant]["labels"].append(batch.labels.cpu())
                 store[variant]["preds"].append(prediction)
                 store[variant]["masks"].append(batch.sequence_mask.cpu())
+                for b in range(batch.labels.size(0)):
+                    for t in range(batch.labels.size(1)):
+                        if not bool(batch.sequence_mask[b, t]):
+                            continue
+                        label = float(batch.labels[b, t])
+                        if task == "regression" and label == 0.0:
+                            continue
+                        pred = float(prediction[b, t])
+                        store[variant]["rows"].append(
+                            {
+                                "mode": variant,
+                                "sample_id": batch.sample_ids[b],
+                                "dialogue_id": batch.sample_ids[b],
+                                "utterance_id": batch.utterance_ids[b][t],
+                                "label": label,
+                                "prediction": pred,
+                                "abs_error": abs(pred - label),
+                                "correct": int((pred > 0) == (label > 0))
+                                if task == "regression"
+                                else int(pred == label),
+                            }
+                        )
     results = {}
     for variant in variants:
         metrics = _metrics(
@@ -185,6 +210,14 @@ def main() -> int:
     (output_dir / "s0_attribution.json").write_text(
         json.dumps({"gamma": args.gamma, "variants": results}, indent=2, sort_keys=True) + "\n"
     )
+    import csv
+
+    for variant in variants:
+        rows = store[variant]["rows"]
+        with (output_dir / f"per_sample_{variant}.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
     print(json.dumps(results, indent=2, sort_keys=True))
     return 0
 
