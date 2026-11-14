@@ -42,6 +42,7 @@ def main() -> int:
     parser.add_argument("--mask-manifest", required=True)
     parser.add_argument("--split", choices=("train", "validation"), required=True)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--builder", choices=("v2", "v3"), default="v2")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
     payload = torch.load(args.student_checkpoint, map_location="cpu", weights_only=False)
@@ -54,10 +55,20 @@ def main() -> int:
     loader = _make_loader(PERDatasetAdapter(dataset, split[key]), cli, training=False)
     bank = KnowledgeContextRetriever.load(args.knowledge_index)
     retrieval = RAGPTAdapter(bank.retrieve, top_k=args.top_k, bank_split="train")
+    if args.builder == "v3":
+        from ComP.knowledge.kb_v3 import VaderKnowledgeExtractor
+
+        extractor = VaderKnowledgeExtractor()
+        source_type = "vader_lexicon"
+        source_version = "kb_v3"
+    else:
+        extractor = RuleBasedKnowledgeExtractorV2()
+        source_type = "train_retrieved_rule_v2"
+        source_version = "knowledge-rule-v2"
     bridger = KnowledgeBridgerAdapter(
-        RuleBasedKnowledgeExtractorV2(),
-        source_type="train_retrieved_rule_v2",
-        source_version="knowledge-rule-v2",
+        extractor,
+        source_type=source_type,
+        source_version=source_version,
         source_license="research-only",
     )
     adim, tdim, vdim = dataset.get_featDim()
@@ -76,7 +87,7 @@ def main() -> int:
         for card in cards.values():
             handle.write(json.dumps(dataclasses.asdict(card), sort_keys=True) + "\n")
     report = {
-        "card_version": "v2",
+        "card_version": args.builder,
         "cards": len(cards),
         "split": args.split,
         "top_k": args.top_k,

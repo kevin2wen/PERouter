@@ -82,6 +82,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--composite-lambda-cls", type=float, default=0.5)
     p.add_argument("--composite-lambda-flip", type=float, default=0.5)
     p.add_argument("--structured-filter", action="store_true")
+    p.add_argument("--card-version", choices=("v1", "v2", "v3"), default="v1")
     return p
 
 
@@ -588,6 +589,31 @@ def main() -> int:
             seed=args.seed,
             bank=bank,
         )
+        if cli.card_version in {"v2", "v3"}:
+            from ComP.knowledge.adapters.knowledge_bridger_adapter import (
+                KnowledgeBridgerAdapter,
+            )
+
+            if cli.card_version == "v3":
+                from ComP.knowledge.kb_v3 import VaderKnowledgeExtractor
+
+                pipeline.bridger_adapter = KnowledgeBridgerAdapter(
+                    VaderKnowledgeExtractor(),
+                    source_type="vader_lexicon",
+                    source_version="kb_v3",
+                    source_license="MIT",
+                )
+            else:
+                from ComP.knowledge.card_builder_v2 import (
+                    RuleBasedKnowledgeExtractorV2,
+                )
+
+                pipeline.bridger_adapter = KnowledgeBridgerAdapter(
+                    RuleBasedKnowledgeExtractorV2(),
+                    source_type="train_retrieved_rule_v2",
+                    source_version="knowledge-rule-v2",
+                    source_license="research-only",
+                )
         if not cli.card_adapter_checkpoint:
             raise ValueError("card modes require --card-adapter-checkpoint")
         if adapter_payload is None:
