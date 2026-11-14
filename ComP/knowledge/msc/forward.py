@@ -31,7 +31,7 @@ def apply_subset(
             else None
         )
         if name == target:
-            keep = subset_mask.bool()
+            keep = subset_mask.to(device=mask.device, dtype=torch.bool)
             mask[batch_index, time_index] = keep
             confidence[batch_index, time_index] = (
                 evidence.source_confidence[batch_index, time_index]
