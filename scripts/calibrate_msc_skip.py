@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ComP.knowledge.msc.calibration import fit_calibration, save_calibration
+from ComP.knowledge.msc.power import bootstrap_auc_ci
 from ComP.knowledge.msc.single_eu import MSCSingleEU
 
 
@@ -83,6 +84,15 @@ def main() -> int:
     ]
     helpful = ((target > 0) & valid).flatten()
     scores = utility.flatten()
+    auc = bootstrap_auc_ci(
+        scores[valid.flatten()].numpy(),
+        helpful[valid.flatten()].numpy(),
+        n_boot=1000,
+    )
+    predicted_index = utility.masked_fill(~valid, -1e9).argmax(dim=-1)
+    predicted_true = target.gather(1, predicted_index[:, None]).squeeze(1)
+    true_best = target.masked_fill(~valid, -1e9).max(dim=-1).values
+    top1_regret = float((true_best - predicted_true).mean())
     calibration = fit_calibration(
         output["skip_logit"].cpu().numpy(),
         cache["skip_label"][index].numpy(),
@@ -96,6 +106,10 @@ def main() -> int:
     calibration["utility_spearman"] = float(np.nanmean(rho_values))
     calibration["helpful_count"] = int(helpful.sum())
     calibration["candidates"] = int(valid.sum())
+    calibration["helpfulness_auc"] = auc["auc"]
+    calibration["helpfulness_auc_ci_low"] = auc["ci_low"]
+    calibration["helpfulness_auc_ci_high"] = auc["ci_high"]
+    calibration["top1_regret"] = top1_regret
     save_calibration(calibration, args.output)
     print(json.dumps(calibration, indent=2, sort_keys=True))
     return 0
