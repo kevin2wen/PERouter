@@ -65,6 +65,7 @@ def build_single_card(args) -> int:
         "single_utility": utility,
         "skip_label": skip_label,
         "skip_utility": cache["skip_utility"],
+        "target_action": cache.get("target_action"),
     }
     torch.save(payload, output / "msc_single_cache.pt")
     (output / "msc_single_manifest.json").write_text(
