@@ -51,6 +51,7 @@ def build_single_card(args) -> int:
         "msc_format_version": 1,
         "split": cache["split"],
         "query_ids": cache["query_ids"],
+        "records": cache.get("records", []),
         "observed_mask": cache["observed_mask"],
         "target_modality": cache["target_modality"],
         "missing_pattern": cache["missing_pattern"],

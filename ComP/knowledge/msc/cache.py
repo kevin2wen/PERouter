@@ -58,6 +58,7 @@ def build_state_cache(cache: Dict, *, extra: Dict | None = None) -> Dict:
         "cache_key": cache.get("cache_key"),
         "split": cache.get("split"),
         "query_ids": query_ids,
+        "records": records,
         **state,
         "candidate_ids": cache["candidate_ids"],
         "candidate_mask": cache["candidate_mask"],
