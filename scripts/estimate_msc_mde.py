@@ -66,11 +66,25 @@ def main() -> int:
             fieldnames=(
                 "metric", "clusters", "mean_delta", "sd", "mde",
                 "target_effect", "detects_target", "required_clusters",
+                "alpha", "power",
             ),
         )
         writer.writeheader()
         for metric, stats in report.items():
-            writer.writerow({"metric": metric, **stats})
+            writer.writerow(
+                {
+                    "metric": metric,
+                    "clusters": stats["clusters"],
+                    "mean_delta": stats["mean_delta"],
+                    "sd": stats["sd"],
+                    "mde": stats["mde"],
+                    "target_effect": stats["target_effect"],
+                    "detects_target": stats["detects_target"],
+                    "required_clusters": stats["required_clusters"],
+                    "alpha": stats["alpha"],
+                    "power": stats["power"],
+                }
+            )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
