@@ -97,6 +97,13 @@ def main() -> int:
     )
     scorer.load_state_dict(ckpt["state_dict"], strict=True)
     scorer.to(device).eval()
+    semantic_encoder = None
+    if ckpt.get("candidate_feature_kind") == "semantic":
+        from ComP.knowledge.msc.card_encoder import SentenceCardEncoder
+
+        semantic_encoder = SentenceCardEncoder(
+            ckpt["semantic_model_path"], device="cpu"
+        )
     selector = SingleEUSelector(
         tau_skip=float(calibration["tau_skip"]),
         utility_threshold=0.0,
@@ -110,6 +117,29 @@ def main() -> int:
         for batch_index, full_cpu in enumerate(target_loader):
             batch = _apply_manifest(full_cpu, manifest, device)
             result = pipeline.build(batch)
+            semantic_vectors = {}
+            if semantic_encoder is not None:
+                card_by_id = {
+                    str(card.knowledge_id): card for card in result.cards
+                }
+                unique_ids = sorted(card_by_id)
+                if unique_ids:
+                    embeddings = semantic_encoder.encode(
+                        [
+                            semantic_encoder.card_text(
+                                {
+                                    "evidence_text": card_by_id[card_id].evidence_text,
+                                    "trigger_text": card_by_id[card_id].trigger_text,
+                                    "relation_type": card_by_id[card_id].relation_type,
+                                }
+                            )
+                            for card_id in unique_ids
+                        ]
+                    )
+                    semantic_vectors = {
+                        card_id: torch.from_numpy(embeddings[index])
+                        for index, card_id in enumerate(unique_ids)
+                    }
             prompt_output = model(
                 batch.features, batch.availability, evidence=None,
                 return_intermediates=True,
@@ -132,7 +162,11 @@ def main() -> int:
                 )
             for target_index, target in enumerate(MODALITIES):
                 evidence = result.evidence_by_target[target]
-                projected = model.evidence_encoder.projections[target](evidence.features)
+                projected = (
+                    model.evidence_encoder.projections[target](evidence.features)
+                    if semantic_encoder is None
+                    else None
+                )
                 rows, obs, tgt, pat, rate, prompts, cv, cm, conf, conflict = (
                     [], [], [], [], [], [], [], [], [], []
                 )
@@ -155,7 +189,22 @@ def main() -> int:
                         pat.append(int("".join(str(int(v)) for v in missing.tolist()), 2))
                         rate.append(float(missing.mean()))
                         prompts.append(prompt_output.prompt_candidates[target][b, t].cpu())
-                        cv.append(projected[b, t].cpu())
+                        if semantic_encoder is None:
+                            cv.append(projected[b, t].cpu())
+                        else:
+                            cv.append(
+                                torch.stack(
+                                    [
+                                        semantic_vectors.get(
+                                            str(evidence.ids[b][t][rank]),
+                                            torch.zeros(
+                                                ckpt["candidate_dim"]
+                                            ),
+                                        )
+                                        for rank in range(evidence.mask.size(-1))
+                                    ]
+                                )
+                            )
                         cm.append(valid.cpu())
                         conf.append(evidence.source_confidence[b, t].cpu())
                         conflict.append(

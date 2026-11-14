@@ -172,6 +172,10 @@ def main() -> int:
                     "use_semantic": variant in {"s1", "s2"},
                     "use_cross_attention": variant == "s2",
                     "use_skip_head": True,
+                    "candidate_feature_kind": (
+                        "semantic" if cache.get("semantic_model_path") else "projection"
+                    ),
+                    "semantic_model_path": cache.get("semantic_model_path"),
                     "utility_scorer_hash": state_hash(state, "scorer."),
                     "state_encoder_hash": state_hash(state, "state_encoder."),
                     "single_cache_sha256": sha256_file(args.single_cache),
