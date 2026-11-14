@@ -48,6 +48,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--min-helpful-gain", type=float, default=0.0)
     p.add_argument("--max-batches", type=int, default=0)
     p.add_argument("--structured-features", action="store_true")
+    p.add_argument("--card-version", choices=("v1", "v2"), default="v1")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output", required=True)
     return p
@@ -130,6 +131,18 @@ def main() -> int:
         seed=args.seed,
         bank=bank,
     )
+    if getattr(cli, "card_version", "v1") == "v2":
+        from ComP.knowledge.adapters.knowledge_bridger_adapter import (
+            KnowledgeBridgerAdapter,
+        )
+        from ComP.knowledge.card_builder_v2 import RuleBasedKnowledgeExtractorV2
+
+        pipeline.bridger_adapter = KnowledgeBridgerAdapter(
+            RuleBasedKnowledgeExtractorV2(),
+            source_type="train_retrieved_rule_v2",
+            source_version="knowledge-rule-v2",
+            source_license="research-only",
+        )
     adapter = torch.load(
         cli.card_adapter_checkpoint, map_location="cpu", weights_only=False
     )
