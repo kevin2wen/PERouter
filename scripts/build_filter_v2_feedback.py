@@ -173,6 +173,7 @@ def main() -> int:
                                 str(int(v)) for v in
                                 (~batch.availability[b, t]).to(torch.int).tolist()), 2),
                             "missing_rate": float((~batch.availability[b, t]).float().mean()),
+                            "label": float(y),
                             "candidate_ids": [str(evidence.ids[b][t][r]) for r in ranks],
                             "candidate_texts": [
                                 card_text_by_id.get(
@@ -182,6 +183,14 @@ def main() -> int:
                             ],
                             "candidate_mask": [True] * len(ranks),
                             "empty_logits": empty.cpu(),
+                            "empty_regression": (
+                                float(empty.float().reshape(-1)[0])
+                                if task == "regression" else None
+                            ),
+                            "candidate_regression": (
+                                [float(x.float().reshape(-1)[0]) for x in card_logits]
+                                if task == "regression" else None
+                            ),
                             "u_ce": u_ce,
                             "u_corr": u_corr,
                             "u_mae": u_mae,
