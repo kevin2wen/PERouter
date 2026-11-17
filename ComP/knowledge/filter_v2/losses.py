@@ -39,6 +39,42 @@ def pairwise_magnitude(prediction, target, mask, eps: float = 1e-6):
     return torch.stack(total).mean() if total else torch.zeros((), device=prediction.device)
 
 
+def pairwise_weighted(prediction, target, mask, eps: float = 1e-6):
+    """Magnitude-weighted pairwise Huber with per-query scale normalization."""
+    mask = mask.bool()
+    total = []
+    for row in range(prediction.size(0)):
+        valid = mask[row].nonzero(as_tuple=False).flatten()
+        if valid.numel() < 2:
+            continue
+        t = target[row, valid]
+        if float(t.max()) <= eps:
+            continue
+        p = prediction[row, valid]
+        pairs_t = []
+        for i in range(valid.numel()):
+            for j in range(i + 1, valid.numel()):
+                pairs_t.append(abs(float(t[i] - t[j])))
+        scale = max(
+            float(t.std(unbiased=False)),
+            float(torch.tensor(pairs_t).median()) if pairs_t else 0.0,
+            eps,
+        )
+        diff_t = (t.unsqueeze(1) - t.unsqueeze(0)) / scale
+        diff_p = (p.unsqueeze(1) - p.unsqueeze(0)) / scale
+        weight = diff_t.abs()
+        upper = torch.triu(
+            torch.ones_like(diff_t, dtype=torch.bool), diagonal=1
+        )
+        if upper.any():
+            total.append(
+                (weight[upper] * F.huber_loss(
+                    diff_p[upper], diff_t[upper], reduction="none"
+                )).mean()
+            )
+    return torch.stack(total).mean() if total else torch.zeros((), device=prediction.device)
+
+
 def listwise_positive(prediction, target, mask, temperature: float = 0.5):
     mask = mask.bool()
     terms = []
@@ -71,6 +107,7 @@ def filter_v2_loss(
     loss_abs = huber_masked(output["utility"], u_ce, mask)
     loss_corr = corr_bce(output["correctness"], u_corr, mask)
     loss_pair = pairwise_magnitude(output["utility"], u_ce, mask)
+    loss_pair_weighted = pairwise_weighted(output["utility"], u_ce, mask)
     loss_list = listwise_positive(output["utility"], u_ce, mask, list_temperature)
     loss = loss_abs + lambda_corr * loss_corr + lambda_pair * loss_pair + lambda_list * loss_list
     if aux_mae and output.get("mae_utility") is not None:
@@ -80,5 +117,6 @@ def filter_v2_loss(
         "abs": loss_abs,
         "corr": loss_corr,
         "pair": loss_pair,
+        "pair_weighted": loss_pair_weighted,
         "list": loss_list,
     }

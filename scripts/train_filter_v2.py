@@ -18,7 +18,9 @@ from ComP.knowledge.filter_v2.calibration import fit_threshold_f1
 from ComP.knowledge.filter_v2.features import state_features
 from ComP.knowledge.filter_v2.losses import filter_v2_loss
 from ComP.knowledge.filter_v2.metrics import (
+    action_regret,
     helpfulness_auc,
+    query_macro_auc,
     top1_regret,
     utility_spearman,
 )
@@ -46,7 +48,7 @@ def build_tensors(records, embeddings, task, max_k=5):
         mae = torch.zeros(max_k)
         for index, text in enumerate(record["candidate_texts"][:max_k]):
             cand[index] = embeddings.get(text, torch.zeros(384))
-            mask[index] = True
+            mask[index] = bool(record.get("candidate_mask", [True] * k)[index])
             ce[index] = float(record["u_ce"][index])
             corr[index] = float(record["u_corr"][index])
             mae[index] = float(record["u_mae"][index])
@@ -186,9 +188,12 @@ def main() -> int:
             stale += 1
             if stale >= args.patience:
                 break
+    checkpoint = torch.load(Path(args.output_dir) / "best.pt", map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    model.eval()
     with torch.no_grad():
         val_out = model(
-            tensors["state"][val_index] if False else tensors["candidates"][val_index],
+            tensors["candidates"][val_index],
             tensors["mask"][val_index],
             tensors["state"][val_index],
             torch.ones(len(val_index), 5, device=device),
@@ -214,9 +219,13 @@ def main() -> int:
     mask = eval_tensors["mask"].cpu().numpy()
     metrics = {
         "queries": int(mask.shape[0]),
-        "helpfulness_auc": helpfulness_auc(prediction, target, mask),
+        "pooled_auc": helpfulness_auc(prediction, target, mask),
+        "query_macro_auc": query_macro_auc(prediction, target, mask),
         "utility_spearman": utility_spearman(prediction, target, mask),
-        "top1_regret": top1_regret(prediction, target, mask),
+        "within_top5_regret": top1_regret(prediction, target, mask),
+        "action_regret": action_regret(
+            prediction, target, mask, tau=calibration["tau"]
+        ),
         "utility_mae": float(
             np.abs(prediction[mask] - target[mask]).mean()
         ),

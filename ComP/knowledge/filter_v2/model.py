@@ -43,12 +43,6 @@ class FilterV2Model(nn.Module):
             if aux_mae
             else None
         )
-        self.skip_head = nn.Sequential(
-            nn.Linear(hidden_dim + state_dim + 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
 
     def forward(
         self,
@@ -82,19 +76,8 @@ class FilterV2Model(nn.Module):
         mae = self.mae_head(hidden).squeeze(-1) if self.mae_head is not None else None
         if mae is not None:
             mae = mae.masked_fill(~mask, 0.0)
-        pooled = (hidden * mask.unsqueeze(-1)).sum(1) / mask.sum(
-            1, keepdim=True
-        ).clamp_min(1)
-        stats = torch.stack(
-            [source_confidence.float().mean(1), source_confidence.float().max(1).values],
-            dim=-1,
-        )
-        skip_logit = self.skip_head(
-            torch.cat([pooled, state_vector, stats], dim=-1)
-        ).squeeze(-1)
         return {
             "utility": utility,
             "correctness": corr,
             "mae_utility": mae,
-            "skip_logit": skip_logit,
         }
